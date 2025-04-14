@@ -1,0 +1,10 @@
+[workspace]
+members = [ "ramon-km",
+    "ramon-client" ,
+    "common" ,
+    "xtask" ,
+]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1"
