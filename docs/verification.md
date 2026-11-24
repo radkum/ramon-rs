@@ -52,9 +52,21 @@ released. But in the lab that variant hung the guest during unload (twice, with 
 connected client), so it was reverted. The next step is to find that hang (unload ordering? BFE
 waiting on an in-flight classify?) before landing the fix.
 
+## Driver Verifier
+
+`verifier /standard /driver C:\Windows\System32\drivers\ramon.sys` (special pool, force IRQL
+checking, pool tracking, I/O verification, deadlock detection, security checks, DDI compliance;
+file-system-filter rules included), then one full cycle - install, client for 3 s, unload:
+
+- 366 events decoded, `SMOKE TEST PASSED`;
+- 0 bugchecks, no Driver Verifier events in the System log;
+- `fltmc filters` empty after the unload.
+
+The verifier was reset afterwards. A separate load/unload cycle with the verifier active also
+returned from `fltmc unload` with 0 and unregistered the filter.
+
 ## Not done yet
 
-- Driver Verifier (`verifier /standard /driver ramon.sys`) - not run against this build.
 - A long load/unload loop - blocked by the WFP issue above (each cycle needs a reboot).
 - Fuzzing of `common`'s deserializer (the host tests cover truncated/garbage input only).
 - Any test on real hardware or a non-VM machine.
