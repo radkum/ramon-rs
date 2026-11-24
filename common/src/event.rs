@@ -106,3 +106,56 @@ impl EventHeader {
         self
     }
 }
+
+#[cfg(all(test, feature = "client"))]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use crate::event::{file_create::FileCreateEvent, process_create::ProcessCreateEvent};
+
+    #[test]
+    fn event_type_rejects_short_buffer() {
+        assert_eq!(get_event_type(&[]), None);
+        assert_eq!(get_event_type(&[0x43]), None);
+        assert_eq!(get_event_type(&[0x43, 0x52, 0x45]), None);
+    }
+
+    #[test]
+    fn header_rejects_short_buffer() {
+        assert!(EventHeader::deserialize(&[]).is_none());
+        assert!(EventHeader::deserialize(&[0u8; 7]).is_none());
+    }
+
+    #[test]
+    fn serialize_header_matches_body_length() {
+        let event = FileCreateEvent::new("C:\\x".into());
+        let bytes = event.serialize().unwrap();
+        let header = EventHeader::deserialize(&bytes).unwrap();
+        assert_eq!(header.event_class, FileCreateEvent::EVENT_CLASS);
+        assert_eq!(
+            header.event_size as usize,
+            bytes.len() - EventHeader::EVENT_HEADER_SIZE
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_truncated_body() {
+        let bytes = FileCreateEvent::new("C:\\x".into()).serialize().unwrap();
+        assert!(FileCreateEvent::deserialize(&bytes[..EventHeader::EVENT_HEADER_SIZE]).is_none());
+        assert!(FileCreateEvent::deserialize(&bytes[..bytes.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn deserialize_rejects_other_class() {
+        let bytes = FileCreateEvent::new("x".into()).serialize().unwrap();
+        assert!(ProcessCreateEvent::deserialize(&bytes).is_none());
+    }
+
+    #[test]
+    fn deserialize_ignores_trailing_bytes() {
+        let mut bytes = FileCreateEvent::new("x".into()).serialize().unwrap();
+        bytes.push(0xaa);
+        assert!(FileCreateEvent::deserialize(&bytes).is_some());
+    }
+}

@@ -184,10 +184,12 @@ This is an example. What that means concretely:
 6. **Scope.** x64 only. No policy, no blocking except guardrail denies and Mirage redirection (both
    opt-in over the port), no persistence of state across reboot, no self-protection (the driver is
    not PPL/ELAM), no signature.
-7. **WFP teardown is unfinished.** The minifilter unloads cleanly, but in the lab run the WFP
-   sublayer/callout/filter objects were still present after unload: the callout registration keeps
-   the driver image mapped, so `ramon.sys` cannot be replaced until a reboot. The teardown calls'
-   return codes are ignored - this is the next thing to fix in `net::stop`.
+7. **WFP teardown is broken (open).** `net::stop` runs the WFP teardown APIs while holding the state
+   `FAST_MUTEX` (APC_LEVEL) and they require PASSIVE_LEVEL, so they return `STATUS_NOT_SUPPORTED`:
+   the sublayer, callout objects and filters stay in BFE and the callout registration keeps the
+   driver image mapped, so `ramon.sys` cannot be replaced until a reboot. A variant that releases
+   the lock first does clean BFE and release the image, but hung the guest during unload in the lab,
+   so it is not landed. Details and measurements: [docs/verification.md](docs/verification.md).
 8. **Mirage and MOTA are detection aids, not boundaries.** Mirage hides a decoy from one process
    tree by rewriting the create path; a determined caller can reach the file by other means. MOTA
    keys on `FileId`, so it sees reopens but not a copy made through an untagged process first.

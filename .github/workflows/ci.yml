@@ -18,6 +18,8 @@ jobs:
         run: cargo test -p ariadne -p common
       - name: Build the client
         run: cargo build -p ramon-client
+      - name: Clippy
+        run: cargo clippy -p ariadne -p common --all-targets -- -D warnings
 
   fmt:
     runs-on: windows-latest
