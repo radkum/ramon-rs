@@ -135,14 +135,13 @@ fltmc unload ramon
 This is an example. What that means concretely:
 
 1. **Global state.** State is process-wide: one driver instance, no per-volume or per-client
-   isolation, and no cleanup ordering beyond the unload callback. `guardrail`, `mirage`, `mota` and
-   `section_sync` keep it in `Locked<T>` (`src/locked.rs`: a `FAST_MUTEX` and its data, reachable
-   only through a guard), so those modules have no `static mut` and no `static_mut_refs` allowance.
-   `net` (the WFP ring and flow pool), `send_message` (the queue and sender thread state),
-   `object_notify`, `minifilter`, `lib` and `process_notify` still use `static mut` with an explicit
-   lock around every access; those are the next candidates for the same treatment. A production
-   driver would hang the same state off the filter/instance contexts (`FltAllocateContext`) or the
-   device object.
+   isolation, and no cleanup ordering beyond the unload callback. Module state lives in `Locked<T>`
+   (`src/locked.rs`: a `FAST_MUTEX` and its data, reachable only through a guard) or in
+   `SpinLocked<T>` (`src/spinlock.rs`: the same for state read at DISPATCH), plus a few lock-free
+   atomics and one raw-pointer callout state. There is **no `static mut`** and no
+   `static_mut_refs` allowance in the driver. A production driver would hang the same state off the
+   filter/instance contexts (`FltAllocateContext`) or the device object, which would also allow more
+   than one instance.
 2. **A stuck client costs up to 10 s.** When the 32768-entry queue is full, callbacks wait for
    space; if one event has been waiting longer than `STALL` (10 s), the event is dropped and counted
    (`G_DROPPED`). A production sensor would drop at once or disconnect the client. A *disconnected*

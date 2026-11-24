@@ -5,8 +5,6 @@
 //! existing canary channel is raised (`CanaryEvent`), so the client's canary alert fires.
 //! `IoReplaceFileObjectName`/`FltSetCallbackDataDirty` are not in `km-api-sys`, so they are declared
 //! here against the WDK ABI. Both are PASSIVE_LEVEL only; the pre-op normally is.
-#![allow(static_mut_refs)]
-
 use alloc::{string::String, vec::Vec};
 
 use ariadne::SessionTag;

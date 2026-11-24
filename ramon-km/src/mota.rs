@@ -3,8 +3,6 @@
 //! boot). When a process outside the agent tree opens a marked file, the delayed execution is
 //! reported. The `Flt*Context` and `FltQueryInformationFile` APIs are not in `km-api-sys`, so they are
 //! declared here against the WDK ABI.
-#![allow(static_mut_refs)]
-
 use alloc::string::String;
 use core::{
     mem::size_of,

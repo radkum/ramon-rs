@@ -11,7 +11,6 @@ use core::{
     ptr::{null, null_mut},
 };
 
-use kernel_fast_mutex::auto_lock::AutoLock;
 use kernel_macros::NT_SUCCESS;
 use km_api_sys::{
     flt_kernel::{FltSendMessage, CONST_PVOID},
@@ -29,8 +28,8 @@ use winapi::{
 };
 
 use crate::{
+    locked::Locked,
     minifilter::{Minifilter, S_MINIFILTER},
-    G_MUTEX,
 };
 
 // not declared in km-api-sys
@@ -63,31 +62,56 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 const LOW_REALTIME_PRIORITY: i32 = 16;
 
 // callbacks only queue events; one thread sends them, so a slow client never blocks the system.
-// The thread swaps G_QUEUE with G_SPARE and sends the batch: neither ever grows.
+// The thread swaps `queue` with its `batch` and sends the batch: neither ever grows.
 const QUEUE_LEN: usize = 32768;
-static mut G_QUEUE: Vec<Vec<u8>> = Vec::new();
-static mut G_SPARE: Vec<Vec<u8>> = Vec::new();
-static mut G_WAKE: KEVENT = unsafe { mem::zeroed() };
 // queue full: callbacks wait for space, unless one event has been stuck longer than STALL (hung client)
-static mut G_SPACE: KEVENT = unsafe { mem::zeroed() };
-static mut G_DELIVERING_SINCE: u64 = 0;
 const STALL: u64 = 1000 * 10_000;
-static mut G_STOP: bool = false;
-static mut G_DROPPED: u32 = 0;
-static mut G_THREAD: HANDLE = null_mut();
+
+struct Sender {
+    queue: Vec<Vec<u8>>,
+    spare: Vec<Vec<u8>>,
+    wake: KEVENT,
+    space: KEVENT,
+    delivering_since: u64,
+    stop: bool,
+    dropped: u32,
+    thread: HANDLE,
+}
+
+static G_SENDER: Locked<Sender> = Locked::new(Sender {
+    queue: Vec::new(),
+    spare: Vec::new(),
+    // a zeroed KEVENT is valid only after KeInitializeEvent, which start_sender does before use
+    wake: unsafe { mem::zeroed() },
+    space: unsafe { mem::zeroed() },
+    delivering_since: 0,
+    stop: false,
+    dropped: 0,
+    thread: null_mut(),
+});
+
+/// The events live in the static for the driver's lifetime. The pointers are handed out so the
+/// sender thread and `send_message` can wait on them without holding the mutex (a FAST_MUTEX must
+/// not be held across `KeWaitForSingleObject`).
+fn events() -> (*mut KEVENT, *mut KEVENT) {
+    let sender = G_SENDER.lock();
+    (&sender.wake as *const KEVENT as *mut KEVENT, &sender.space as *const KEVENT as *mut KEVENT)
+}
 
 pub(crate) unsafe fn start_sender() -> NTSTATUS {
-    if G_QUEUE.try_reserve_exact(QUEUE_LEN).is_err()
-        || G_SPARE.try_reserve_exact(QUEUE_LEN).is_err()
+    let mut sender = G_SENDER.lock();
+    if sender.queue.try_reserve_exact(QUEUE_LEN).is_err()
+        || sender.spare.try_reserve_exact(QUEUE_LEN).is_err()
     {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    KeInitializeEvent(&mut G_WAKE, SynchronizationEvent, FALSE);
-    KeInitializeEvent(&mut G_SPACE, NotificationEvent, FALSE);
+    KeInitializeEvent(&mut sender.wake, SynchronizationEvent, FALSE);
+    KeInitializeEvent(&mut sender.space, NotificationEvent, FALSE);
     let mut oa: OBJECT_ATTRIBUTES = mem::zeroed();
     InitializeObjectAttributes(&mut oa, null_mut(), OBJ_KERNEL_HANDLE, null_mut(), null_mut());
+    // the thread takes the same mutex, so it blocks until this guard is dropped
     PsCreateSystemThread(
-        &mut G_THREAD,
+        &mut sender.thread,
         SYNCHRONIZE,
         &mut oa,
         null_mut(),
@@ -99,24 +123,26 @@ pub(crate) unsafe fn start_sender() -> NTSTATUS {
 
 /// Call after the notify callbacks are removed and before the minifilter is dropped.
 pub(crate) unsafe fn stop_sender() {
-    {
-        let _locker = AutoLock::new(&mut G_MUTEX);
-        G_STOP = true;
-    }
-    if !G_THREAD.is_null() {
-        KeSetEvent(&mut G_WAKE, 0, FALSE);
-        ZwWaitForSingleObject(G_THREAD, FALSE, null());
-        ZwClose(G_THREAD);
-        G_THREAD = null_mut();
+    let (wake, thread) = {
+        let mut sender = G_SENDER.lock();
+        sender.stop = true;
+        (&mut sender.wake as *mut KEVENT, sender.thread)
+    };
+    if !thread.is_null() {
+        KeSetEvent(wake, 0, FALSE);
+        ZwWaitForSingleObject(thread, FALSE, null());
+        ZwClose(thread);
+        G_SENDER.lock().thread = null_mut();
     }
     let queue = {
-        let _locker = AutoLock::new(&mut G_MUTEX);
-        mem::take(&mut G_QUEUE)
+        let mut sender = G_SENDER.lock();
+        mem::take(&mut sender.queue)
     };
     drop(queue);
-    drop(mem::take(&mut G_SPARE));
-    if G_DROPPED != 0 {
-        log::warn!("events dropped (queue full or stopping): {}", G_DROPPED);
+    drop(mem::take(&mut G_SENDER.lock().spare));
+    let dropped = G_SENDER.lock().dropped;
+    if dropped != 0 {
+        log::warn!("events dropped (queue full or stopping): {}", dropped);
     }
 }
 
@@ -125,30 +151,39 @@ pub(crate) fn send_message(event: Vec<u8>) {
         return;
     }
     let mut event = event;
-    unsafe {
-        loop {
-            {
-                let _locker = AutoLock::new(&mut G_MUTEX);
-                if G_STOP {
-                    G_DROPPED += 1;
-                    return;
-                }
-                match G_QUEUE.push_within_capacity(event) {
-                    Ok(_) => break,
-                    Err(back) => event = back,
-                }
-                if G_DELIVERING_SINCE != 0 && now() - G_DELIVERING_SINCE > STALL {
-                    G_DROPPED += 1;
-                    return;
-                }
-                KeClearEvent(&mut G_SPACE);
+    let (wake, space) = events();
+    loop {
+        let mut pushed = false;
+        {
+            let mut sender = G_SENDER.lock();
+            if sender.stop {
+                sender.dropped += 1;
+                return;
             }
-            KeSetEvent(&mut G_WAKE, 0, FALSE);
-            // short timeout: KeClearEvent above may race with the sender's KeSetEvent
-            let timeout: i64 = -10 * 10_000;
-            KeWaitForSingleObject(&mut G_SPACE as *mut KEVENT as PVOID, 0, 0, FALSE, &timeout);
+            match sender.queue.push_within_capacity(event) {
+                Ok(_) => {
+                    // `Vec::new` does not allocate; keeping the value initialized lets the loop
+                    // continue without a definite-initialization dance
+                    event = Vec::new();
+                    pushed = true;
+                },
+                Err(back) => event = back,
+            }
+            if !pushed {
+                if sender.delivering_since != 0 && now() - sender.delivering_since > STALL {
+                    sender.dropped += 1;
+                    return;
+                }
+                unsafe { KeClearEvent(space) };
+            }
         }
-        KeSetEvent(&mut G_WAKE, 0, FALSE);
+        unsafe { KeSetEvent(wake, 0, FALSE) };
+        if pushed {
+            return;
+        }
+        // short timeout: KeClearEvent above may race with the sender's KeSetEvent
+        let timeout: i64 = -10 * 10_000;
+        unsafe { KeWaitForSingleObject(space as PVOID, 0, 0, FALSE, &timeout) };
     }
 }
 
@@ -163,29 +198,33 @@ extern "system" fn sender_thread(_context: PVOID) {
 unsafe fn run() {
     // at normal priority a burst of new processes starves the sender for seconds
     KeSetPriorityThread(PsGetCurrentThread(), LOW_REALTIME_PRIORITY);
-    let mut batch = mem::take(&mut G_SPARE);
+    let (wake, space) = events();
+    let mut batch = {
+        let mut sender = G_SENDER.lock();
+        mem::take(&mut sender.spare)
+    };
     loop {
-        KeWaitForSingleObject(&mut G_WAKE as *mut KEVENT as PVOID, 0, 0, FALSE, null());
+        KeWaitForSingleObject(wake as PVOID, 0, 0, FALSE, null());
         loop {
             {
-                let _locker = AutoLock::new(&mut G_MUTEX);
-                if G_STOP {
+                let mut sender = G_SENDER.lock();
+                if sender.stop {
                     return;
                 }
-                mem::swap(&mut G_QUEUE, &mut batch);
+                mem::swap(&mut sender.queue, &mut batch);
                 if batch.is_empty() {
-                    G_DELIVERING_SINCE = 0;
+                    sender.delivering_since = 0;
                     break;
                 }
+                KeSetEvent(space, 0, FALSE);
             }
-            KeSetEvent(&mut G_SPACE, 0, FALSE);
             for event in batch.drain(..) {
                 {
-                    let _locker = AutoLock::new(&mut G_MUTEX);
-                    if G_STOP {
+                    let mut sender = G_SENDER.lock();
+                    if sender.stop {
                         return;
                     }
-                    G_DELIVERING_SINCE = now();
+                    sender.delivering_since = now();
                 }
                 deliver(&event);
             }
@@ -198,16 +237,15 @@ fn now() -> u64 {
 }
 
 unsafe fn is_stopping() -> bool {
-    let _locker = AutoLock::new(&mut G_MUTEX);
-    G_STOP
+    G_SENDER.lock().stop
 }
 
 /// Waits until the client takes the event; drops it only when no client is connected or on stop.
 unsafe fn deliver(event: &[u8]) {
     // stop_sender runs before the minifilter is dropped, so the box outlives this call
     let ramon: *const Minifilter = {
-        let _locker = AutoLock::new(&mut G_MUTEX);
-        S_MINIFILTER.as_deref().map_or(null(), |ramon| ramon)
+        let minifilter = S_MINIFILTER.lock();
+        minifilter.as_deref().map_or(null(), |ramon| ramon)
     };
     let Some(ramon) = ramon.as_ref() else {
         return;

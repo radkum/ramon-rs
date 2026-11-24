@@ -4,8 +4,6 @@
 //! IRQL: post-create and set-information run at PASSIVE_LEVEL; the write and section post-ops
 //! can run at DISPATCH_LEVEL (paging I/O) - those paths only touch atomics and hand the report
 //! to a PASSIVE_LEVEL drain (`section_sync::drain_written`).
-#![allow(static_mut_refs)]
-
 use alloc::string::String;
 use core::{mem::ManuallyDrop, ptr::null_mut};
 

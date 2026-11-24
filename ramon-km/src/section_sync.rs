@@ -4,8 +4,6 @@
 //! a telemetry file is remembered; when a paging write to it completes, its slot is marked with an
 //! atomic bit (safe at DISPATCH) and reported from the next PASSIVE callback. A final report is emitted
 //! when the section is released, so a mapping that never sees a PASSIVE drain is still covered.
-#![allow(static_mut_refs)]
-
 use alloc::{string::String, vec::Vec};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

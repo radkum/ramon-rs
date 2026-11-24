@@ -21,7 +21,9 @@ pub(crate) struct Locked<T> {
 
 // SAFETY: every access to `data` goes through `lock()`, which holds the mutex for the lifetime of
 // the guard; the mutex itself is only touched by the acquire/release calls.
-unsafe impl<T: Send> Sync for Locked<T> {}
+// SAFETY: a kernel driver runs in one address space and every access to `data` goes through the
+// mutex; `T` does not have to be `Send` because there is no thread affinity to respect.
+unsafe impl<T> Sync for Locked<T> {}
 
 impl<T> Locked<T> {
     pub(crate) const fn new(data: T) -> Self {

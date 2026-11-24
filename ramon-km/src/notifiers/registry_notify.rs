@@ -43,8 +43,13 @@ pub extern "system" fn OnRegistryNotify(_context: PVOID, arg1: PVOID, arg2: PVOI
             }
 
             let mut name: PUNICODE_STRING = null_mut();
-            let status =
-                CmCallbackGetKeyObjectIDEx(&G_COOKIE, op_info.Object, null_mut(), &mut name, 0);
+            let status = CmCallbackGetKeyObjectIDEx(
+                &G_COOKIE.lock(),
+                op_info.Object,
+                null_mut(),
+                &mut name,
+                0,
+            );
             if !NT_SUCCESS!(status) {
                 return STATUS_SUCCESS;
             }

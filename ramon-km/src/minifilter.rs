@@ -3,10 +3,13 @@
 //! IRQL: `RamonUnload` and the port callbacks run at PASSIVE_LEVEL; the file callbacks it
 //! dispatches are described in `minifilter/file_monitor.rs`. `RamonUnload` unregisters the
 //! notify callbacks and stops the sender thread before the filter and its state are freed.
-#![allow(static_mut_refs)]
-
 use alloc::boxed::Box;
-use core::{mem, mem::size_of, ptr::null_mut};
+use core::{
+    mem,
+    mem::size_of,
+    ptr::null_mut,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 mod file_monitor;
 use common::{
@@ -14,7 +17,6 @@ use common::{
     constants::{COMM_PORT_NAME, FLT_PORT_ALL_ACCESS},
 };
 use file_monitor::FileMonitor;
-use kernel_fast_mutex::auto_lock::AutoLock;
 use kernel_macros::{HandleToU32, NT_SUCCESS, PAGED_CODE};
 use km_api_sys::{flt_kernel::*, ntddk::PsGetCurrentProcessId};
 use winapi::{
@@ -33,13 +35,14 @@ use winapi::{
 };
 
 use crate::{
+    locked::Locked,
     notifiers::{adopt, adopt_tag, MmCopyMemory, MM_COPY_MEMORY_VIRTUAL},
-    unicode_string, G_MUTEX,
+    unicode_string,
 };
 
 pub(crate) type PMINIFILTER = *mut Minifilter;
-pub(crate) static mut S_MINIFILTER: Option<Box<Minifilter>> = None;
-static mut INSTANCE_NUMBER: usize = 0;
+pub(crate) static S_MINIFILTER: Locked<Option<Box<Minifilter>>> = Locked::new(None);
+static INSTANCE_NUMBER: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) struct Minifilter {
     pub filter_handle: PFLT_FILTER,
@@ -55,23 +58,28 @@ impl Minifilter {
     }
 
     pub(crate) fn create(driver: PDRIVER_OBJECT) -> NTSTATUS {
-        let mut status = STATUS_SUCCESS;
         unsafe {
             log::info!("Minifilter::factory");
-            S_MINIFILTER = match Box::try_new(Minifilter::new_empty()) {
-                Ok(minifilter) => Some(minifilter),
+            S_MINIFILTER.init();
+            let minifilter = match Box::try_new(Minifilter::new_empty()) {
+                Ok(minifilter) => minifilter,
                 Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
             };
-            if let Some(minifilter) = &mut S_MINIFILTER {
-                status = minifilter.init(driver)
-            }
+            // do not hold the lock across init: registering the filter can run instance setup,
+            // which must not re-enter the same FAST_MUTEX
+            let minifilter = {
+                let mut slot = S_MINIFILTER.lock();
+                *slot = Some(minifilter);
+                slot.as_mut().map_or(null_mut(), |minifilter| &mut **minifilter as *mut Minifilter)
+            };
+            let status = (*minifilter).init(driver);
 
             if !NT_SUCCESS!(status) {
                 log::info!("failed to init minifilter. Status: 0x{:08x}", status);
-                S_MINIFILTER = None;
+                *S_MINIFILTER.lock() = None;
             }
+            status
         }
-        status
     }
 
     pub(crate) unsafe fn init(&mut self, driver: PDRIVER_OBJECT) -> NTSTATUS {
@@ -384,10 +392,7 @@ extern "system" fn RamonUnload(_flags: FLT_REGISTRATION_FLAGS) -> NTSTATUS {
         crate::unregister_notify_callbacks();
         crate::send_message::stop_sender();
         // take under the lock send_message holds; drop outside it (FltUnregisterFilter must not run at APC_LEVEL)
-        let minifilter = {
-            let _locker = AutoLock::new(&mut G_MUTEX);
-            S_MINIFILTER.take()
-        };
+        let minifilter = S_MINIFILTER.lock().take();
         // FltUnregisterFilter has returned, so no section callback can run: free the remembered paths
         drop(minifilter);
         crate::section_sync::clear();
@@ -415,9 +420,7 @@ extern "system" fn RamonInstanceSetup(
     _volume_filesystem_type: FLT_FILESYSTEM_TYPE,
 ) -> NTSTATUS {
     log::info!("RamonInstanceSetup");
-    unsafe {
-        INSTANCE_NUMBER += 1;
-    }
+    INSTANCE_NUMBER.fetch_add(1, Ordering::Relaxed);
     PAGED_CODE!();
     STATUS_SUCCESS
 }
@@ -442,9 +445,10 @@ extern "system" fn RamonInstanceTeardownStart(
     _flt_objects: PFLT_RELATED_OBJECTS,
     _flags: FLT_INSTANCE_TEARDOWN_FLAGS,
 ) -> NTSTATUS {
-    unsafe {
-        log::info!("RamonInstanceTeardownStart. Instance num: {}", INSTANCE_NUMBER);
-    }
+    log::info!(
+        "RamonInstanceTeardownStart. Instance num: {}",
+        INSTANCE_NUMBER.load(Ordering::Relaxed)
+    );
 
     PAGED_CODE!();
     log::info!("RamonInstanceTeardownStart SUCCESS");
@@ -460,8 +464,6 @@ extern "system" fn RamonInstanceTeardownComplete(
 
     PAGED_CODE!();
     log::info!("RamonInstanceTeardownComplete SUCCESS");
-    unsafe {
-        INSTANCE_NUMBER -= 1;
-    }
+    INSTANCE_NUMBER.fetch_sub(1, Ordering::Relaxed);
     STATUS_SUCCESS
 }
