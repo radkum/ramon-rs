@@ -139,6 +139,9 @@ pub unsafe extern "system" fn DriverEntry(
         );
 
         if NT_SUCCESS!(status) {
+            // tiny window: a registry callback on another CPU can fire before this assignment and
+            // see cookie = 0, in which case it skips the event (CmCallbackGetKeyObjectIDEx fails).
+            // Benign - no crash, at most one missed registry event in the load window.
             *G_COOKIE.lock() = cookie;
             cleaner.init_registry_callback(cookie);
         } else {

@@ -52,7 +52,7 @@ verified with a stage counter written to the registry after every call (`NetStop
 final step).
 
 Remaining: a **second** load in the same boot (re-registering the callouts after the first teardown)
-hung the lab VM twice, including with a per-load unique WFP session key, so it is not solved. A boot
+hung the lab VM twice, so it is not solved. A boot
 marker in `install.ps1` refuses a second load and asks for a reboot.
 ## Driver Verifier
 

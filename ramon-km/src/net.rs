@@ -387,8 +387,6 @@ static G_RING: SpinLocked<NetRing> = SpinLocked::new(NetRing {
 static G_NET_THREAD: AtomicUsize = AtomicUsize::new(0);
 // set by start(): stop() must not lock an uninitialized state if the driver never started WFP
 static G_STARTED: AtomicUsize = AtomicUsize::new(0);
-// a fresh WFP session key per load, so a reload in the same boot never collides with the old session
-static G_SESSION_SEQ: AtomicU32 = AtomicU32::new(0);
 
 // the event lives in the static for the driver's lifetime; the drain thread waits on it without
 // holding the spinlock
@@ -511,7 +509,8 @@ unsafe fn flow_free(context: u64) {
     if context == 0 {
         return;
     }
-    let base = G_FLOW.get_ptr() as usize;
+    // base of the contexts array, not of FlowPool: the field is not guaranteed at offset 0
+    let base = addr_of_mut!((*G_FLOW.get_ptr()).contexts) as usize;
     let slot = context as usize;
     let size = mem::size_of::<FlowContext>();
     if slot < base || slot >= base + FLOW_POOL * size || (slot - base) % size != 0 {
