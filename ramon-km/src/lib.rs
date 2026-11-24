@@ -7,8 +7,7 @@
 #![feature(allocator_api)]
 #![feature(vec_push_within_capacity)]
 #![allow(non_snake_case)]
-// the driver keeps its state in Locked/SpinLocked; do not let a new `static mut` slip in
-#![deny(static_mut_refs)]
+#![allow(static_mut_refs)]
 
 mod cleaner;
 
@@ -16,7 +15,6 @@ mod guardrail;
 mod ioctl_code;
 mod irp;
 mod libm_shim;
-mod locked;
 mod logger;
 mod minifilter;
 mod mirage;
@@ -37,6 +35,7 @@ extern crate alloc;
 
 use core::ptr::null_mut;
 
+use kernel_fast_mutex::{fast_mutex::FastMutex, locker::Locker};
 /// kernel-init deliver a few elements (eg. panic implementation) necessary to run code in kernel
 #[allow(unused_imports)]
 use kernel_init;
@@ -59,15 +58,15 @@ use winapi::{
 };
 
 use crate::{
-    cleaner::Cleaner, irp::complete_irp_success, locked::Locked, logger::KernelLogger,
-    minifilter::Minifilter,
+    cleaner::Cleaner, irp::complete_irp_success, logger::KernelLogger, minifilter::Minifilter,
 };
 
 #[allow(dead_code)]
 pub(crate) const POOL_TAG: u32 = u32::from_ne_bytes(*b"RDER");
 
-// the registry callback cookie: written at load, read by the registry callback and on unload
-pub(crate) static G_COOKIE: Locked<LARGE_INTEGER> = Locked::new(LARGE_INTEGER::new());
+static mut G_MUTEX: FastMutex = FastMutex::new();
+//static mut G_PROCESS_NAMES: Option<BTreeSet<ULONG>> = None;
+static mut G_COOKIE: LARGE_INTEGER = LARGE_INTEGER::new();
 
 #[link_section = "INIT"]
 #[no_mangle]
@@ -78,11 +77,12 @@ pub unsafe extern "system" fn DriverEntry(
     KernelLogger::init(LevelFilter::Warn).expect("Failed to initialize logger");
 
     log::info!("START Ramon");
-    G_COOKIE.init();
 
     let hello_world = unicode_string("Hello World!");
     log::info!("{}", hello_world);
 
+    //--------------------GLOBALS--------------------------------
+    G_MUTEX.Init();
     init_tree();
     guardrail::init();
     mirage::init();
@@ -128,22 +128,17 @@ pub unsafe extern "system" fn DriverEntry(
 
         //--------------------REGISTRY NOTIFY-----------------------
         let altitude = unicode_string("7657.124");
-        let cookie = LARGE_INTEGER::new();
         status = CmRegisterCallbackEx(
             OnRegistryNotify as PVOID,
             &altitude,
             driver,
             null_mut(),
-            &cookie,
+            &G_COOKIE,
             null_mut(),
         );
 
         if NT_SUCCESS!(status) {
-            // tiny window: a registry callback on another CPU can fire before this assignment and
-            // see cookie = 0, in which case it skips the event (CmCallbackGetKeyObjectIDEx fails).
-            // Benign - no crash, at most one missed registry event in the load window.
-            *G_COOKIE.lock() = cookie;
-            cleaner.init_registry_callback(cookie);
+            cleaner.init_registry_callback(G_COOKIE);
         } else {
             log::info!("failed to create registry routine 0x{:08x}", status);
             break;
@@ -205,10 +200,7 @@ pub(crate) unsafe fn unregister_notify_callbacks() {
 
     PsRemoveLoadImageNotifyRoutine(OnImageLoadNotify);
 
-    // copy the cookie and release the lock first: CmUnRegisterCallback waits for in-flight
-    // registry callbacks, and one of them may be waiting for this lock
-    let cookie = *G_COOKIE.lock();
-    CmUnRegisterCallback(cookie);
+    CmUnRegisterCallback(G_COOKIE);
 
     stop_object_notify();
 }

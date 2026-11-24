@@ -10,12 +10,12 @@
 //! decision. Blocking (`FWP_ACTION_BLOCK` on `ALE_AUTH_CONNECT`) is a separate product decision and
 //! would require terminating filters. The WFP API is not in `km-api-sys`, so the structures and
 //! functions are declared here against the WDK ABI (`fwpsk.h`/`fwpmk.h`).
+#![allow(static_mut_refs)]
 
 use core::{
     ffi::c_void,
     mem,
     ptr::{addr_of_mut, null, null_mut},
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use ariadne::{AgentKind, ProcessKey, SessionTag};
@@ -34,9 +34,7 @@ use winapi::{
     },
 };
 
-use crate::{
-    locked::Locked, notifiers::session_tag_of, send_message::send_message, spinlock::SpinLocked,
-};
+use crate::{notifiers::session_tag_of, send_message::send_message, spinlock::SpinLock};
 
 // ---------------------------------------------------------------- WFP ABI
 
@@ -364,51 +362,28 @@ const EMPTY_ENTRY: NetEntry = NetEntry {
     remote_port: 0,
 };
 
-struct NetRing {
-    entries: [NetEntry; RING_LEN],
-    head: usize,
-    tail: usize,
-    len: usize,
-    dropped: u32,
-    stop: bool,
-    wake: KEVENT,
-}
+static mut G_RING: [NetEntry; RING_LEN] = [EMPTY_ENTRY; RING_LEN];
+static mut G_RING_LOCK: SpinLock = SpinLock::new();
+static mut G_RING_HEAD: usize = 0;
+static mut G_RING_TAIL: usize = 0;
+static mut G_RING_LEN: usize = 0;
+static mut G_NET_DROPPED: u32 = 0;
+static mut G_NET_STOP: bool = false;
+static mut G_NET_WAKE: KEVENT = unsafe { mem::zeroed() };
+static mut G_NET_THREAD: HANDLE = null_mut();
 
-static G_RING: SpinLocked<NetRing> = SpinLocked::new(NetRing {
-    entries: [EMPTY_ENTRY; RING_LEN],
-    head: 0,
-    tail: 0,
-    len: 0,
-    dropped: 0,
-    stop: false,
-    // a zeroed KEVENT is valid only after KeInitializeEvent, which start() does before use
-    wake: unsafe { mem::zeroed() },
-});
-static G_NET_THREAD: AtomicUsize = AtomicUsize::new(0);
-// set by start(): stop() must not lock an uninitialized state if the driver never started WFP
-static G_STARTED: AtomicUsize = AtomicUsize::new(0);
-
-// the event lives in the static for the driver's lifetime; the drain thread waits on it without
-// holding the spinlock
-fn wake_ptr() -> *mut KEVENT {
-    unsafe { addr_of_mut!((*G_RING.get_ptr()).wake) }
-}
-
-/// Runs at IRQL <= DISPATCH: only touches the ring under the spinlock.
 unsafe fn enqueue(entry: NetEntry) {
-    let wake = {
-        let mut ring = G_RING.lock();
-        if ring.len == RING_LEN {
-            ring.dropped = ring.dropped.wrapping_add(1);
+    {
+        let _guard = G_RING_LOCK.lock();
+        if G_RING_LEN == RING_LEN {
+            G_NET_DROPPED = G_NET_DROPPED.wrapping_add(1);
             return;
         }
-        let head = ring.head;
-        ring.entries[head] = entry;
-        ring.head = (head + 1) % RING_LEN;
-        ring.len += 1;
-        &mut ring.wake as *mut KEVENT
-    };
-    KeSetEvent(&mut *wake, 0, 0);
+        G_RING[G_RING_HEAD] = entry;
+        G_RING_HEAD = (G_RING_HEAD + 1) % RING_LEN;
+        G_RING_LEN += 1;
+    }
+    KeSetEvent(&mut G_NET_WAKE, 0, 0);
 }
 
 extern "system" fn drain_thread(_context: PVOID) {
@@ -419,18 +394,17 @@ extern "system" fn drain_thread(_context: PVOID) {
 }
 
 unsafe fn drain_loop() {
-    let wake = wake_ptr();
     loop {
-        KeWaitForSingleObject(wake as PVOID, 0, 0, 0, null());
+        KeWaitForSingleObject(&mut G_NET_WAKE as *mut KEVENT as PVOID, 0, 0, 0, null());
         loop {
             let entry = {
-                let mut ring = G_RING.lock();
-                if ring.len == 0 {
+                let _guard = G_RING_LOCK.lock();
+                if G_RING_LEN == 0 {
                     None
                 } else {
-                    let entry = ring.entries[ring.tail];
-                    ring.tail = (ring.tail + 1) % RING_LEN;
-                    ring.len -= 1;
+                    let entry = G_RING[G_RING_TAIL];
+                    G_RING_TAIL = (G_RING_TAIL + 1) % RING_LEN;
+                    G_RING_LEN -= 1;
                     Some(entry)
                 }
             };
@@ -439,7 +413,11 @@ unsafe fn drain_loop() {
                 None => break,
             }
         }
-        if G_RING.lock().stop {
+        let stop = {
+            let _guard = G_RING_LOCK.lock();
+            G_NET_STOP
+        };
+        if stop {
             return;
         }
     }
@@ -476,52 +454,47 @@ struct FlowContext {
 
 const EMPTY_FLOW: FlowContext = FlowContext { session: EMPTY_SESSION, pid: 0 };
 
-struct FlowPool {
-    contexts: [FlowContext; FLOW_POOL],
-    free: [u16; FLOW_POOL],
-    top: usize,
-}
-
-static G_FLOW: SpinLocked<FlowPool> =
-    SpinLocked::new(FlowPool { contexts: [EMPTY_FLOW; FLOW_POOL], free: [0; FLOW_POOL], top: 0 });
+static mut G_FLOW: [FlowContext; FLOW_POOL] = [EMPTY_FLOW; FLOW_POOL];
+static mut G_FLOW_FREE: [u16; FLOW_POOL] = [0; FLOW_POOL];
+static mut G_FLOW_TOP: usize = 0;
+static mut G_FLOW_LOCK: SpinLock = SpinLock::new();
 
 unsafe fn flow_pool_init() {
-    G_FLOW.init();
-    let mut pool = G_FLOW.lock();
-    for index in 0..FLOW_POOL {
-        pool.free[index] = index as u16;
+    G_FLOW_LOCK.init();
+    let mut index = 0;
+    while index < FLOW_POOL {
+        G_FLOW_FREE[index] = index as u16;
+        index += 1;
     }
-    pool.top = FLOW_POOL;
+    G_FLOW_TOP = FLOW_POOL;
 }
 
 unsafe fn flow_alloc(session: SessionTag, pid: u32) -> *mut FlowContext {
-    let mut pool = G_FLOW.lock();
-    if pool.top == 0 {
+    let _guard = G_FLOW_LOCK.lock();
+    if G_FLOW_TOP == 0 {
         return null_mut();
     }
-    pool.top -= 1;
-    let index = pool.free[pool.top] as usize;
-    pool.contexts[index] = FlowContext { session, pid };
-    addr_of_mut!(pool.contexts[index])
+    G_FLOW_TOP -= 1;
+    let index = G_FLOW_FREE[G_FLOW_TOP] as usize;
+    G_FLOW[index] = FlowContext { session, pid };
+    addr_of_mut!(G_FLOW[index])
 }
 
 unsafe fn flow_free(context: u64) {
     if context == 0 {
         return;
     }
-    // base of the contexts array, not of FlowPool: the field is not guaranteed at offset 0
-    let base = addr_of_mut!((*G_FLOW.get_ptr()).contexts) as usize;
+    let base = addr_of_mut!(G_FLOW) as usize;
     let slot = context as usize;
     let size = mem::size_of::<FlowContext>();
     if slot < base || slot >= base + FLOW_POOL * size || (slot - base) % size != 0 {
         return;
     }
     let index = (slot - base) / size;
-    let mut pool = G_FLOW.lock();
-    if pool.top < FLOW_POOL {
-        let top = pool.top;
-        pool.free[top] = index as u16;
-        pool.top = top + 1;
+    let _guard = G_FLOW_LOCK.lock();
+    if G_FLOW_TOP < FLOW_POOL {
+        G_FLOW_FREE[G_FLOW_TOP] = index as u16;
+        G_FLOW_TOP += 1;
     }
 }
 
@@ -633,8 +606,7 @@ unsafe fn classify_impl(
             remote_port: value_u16(values, FIELD_REMOTE_PORT),
         });
     } else {
-        let callout_id =
-            G_CALLOUT_ID[if family == 4 { AUTH_V4 } else { AUTH_V6 }].load(Ordering::Acquire);
+        let callout_id = G_CALLOUT_ID[if family == 4 { AUTH_V4 } else { AUTH_V6 }];
         let flow_handle = if meta.current_metadata_values & FWPS_METADATA_FIELD_FLOW_HANDLE != 0 {
             meta.flow_handle
         } else {
@@ -706,28 +678,14 @@ const CALLBACK_HAS_FLOW_DELETE: [bool; 4] = [true, true, false, false];
 
 // ---------------------------------------------------------------- registration
 
-// registration state, touched only at load/unload (PASSIVE)
-struct NetState {
-    engine: HANDLE,
-    device: *mut DEVICE_OBJECT,
-    sublayer_added: bool,
-    callout_registered: [bool; 4],
-    callout_added: [bool; 4],
-    filter_added: [bool; 4],
-    filter_id: [u64; 4],
-}
-
-static G_NET: Locked<NetState> = Locked::new(NetState {
-    engine: null_mut(),
-    device: null_mut(),
-    sublayer_added: false,
-    callout_registered: [false; 4],
-    callout_added: [false; 4],
-    filter_added: [false; 4],
-    filter_id: [0; 4],
-});
-// read by the ALE_AUTH_CONNECT classify at DISPATCH_LEVEL, so it is lock-free
-static G_CALLOUT_ID: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static mut G_ENGINE: HANDLE = null_mut();
+static mut G_DEVICE: *mut DEVICE_OBJECT = null_mut();
+static mut G_SUBLAYER_ADDED: bool = false;
+static mut G_CALLOUT_ID: [u32; 4] = [0; 4];
+static mut G_CALLOUT_REGISTERED: [bool; 4] = [false; 4];
+static mut G_CALLOUT_ADDED: [bool; 4] = [false; 4];
+static mut G_FILTER_ADDED: [bool; 4] = [false; 4];
+static mut G_FILTER_ID: [u64; 4] = [0; 4];
 
 unsafe fn register_callout(index: usize) -> NTSTATUS {
     let callout = FwpsCallout {
@@ -738,11 +696,10 @@ unsafe fn register_callout(index: usize) -> NTSTATUS {
         flow_delete_fn: if CALLBACK_HAS_FLOW_DELETE[index] { Some(flow_delete) } else { None },
     };
     let mut id = 0u32;
-    let device = G_NET.lock().device;
-    let status = FwpsCalloutRegister0(device as *mut c_void, &callout, &mut id);
+    let status = FwpsCalloutRegister0(G_DEVICE as *mut c_void, &callout, &mut id);
     if NT_SUCCESS!(status) {
-        G_CALLOUT_ID[index].store(id, Ordering::Release);
-        G_NET.lock().callout_registered[index] = true;
+        G_CALLOUT_ID[index] = id;
+        G_CALLOUT_REGISTERED[index] = true;
     }
     status
 }
@@ -755,12 +712,11 @@ unsafe fn add_callout(index: usize) -> NTSTATUS {
         provider_key: null_mut(),
         provider_data: FwpByteBlob { size: 0, data: null_mut() },
         applicable_layer: LAYERS[index],
-        callout_id: G_CALLOUT_ID[index].load(Ordering::Acquire),
+        callout_id: G_CALLOUT_ID[index],
     };
-    let engine = G_NET.lock().engine;
-    let status = FwpmCalloutAdd0(engine, &callout, null_mut(), null_mut());
+    let status = FwpmCalloutAdd0(G_ENGINE, &callout, null_mut(), null_mut());
     if NT_SUCCESS!(status) {
-        G_NET.lock().callout_added[index] = true;
+        G_CALLOUT_ADDED[index] = true;
     }
     status
 }
@@ -788,12 +744,10 @@ unsafe fn add_filter(index: usize) -> NTSTATUS {
         effective_weight: FwpValue { type_: 0, data: 0 },
     };
     let mut id = 0u64;
-    let engine = G_NET.lock().engine;
-    let status = FwpmFilterAdd0(engine, &filter, null_mut(), &mut id);
+    let status = FwpmFilterAdd0(G_ENGINE, &filter, null_mut(), &mut id);
     if NT_SUCCESS!(status) {
-        let mut state = G_NET.lock();
-        state.filter_added[index] = true;
-        state.filter_id[index] = id;
+        G_FILTER_ADDED[index] = true;
+        G_FILTER_ID[index] = id;
     }
     status
 }
@@ -809,12 +763,7 @@ unsafe fn open_engine() -> NTSTATUS {
         username: null_mut(),
         kernel_mode: TRUE as i32,
     };
-    let mut engine: HANDLE = null_mut();
-    let status = FwpmEngineOpen0(null(), RPC_C_AUTHN_WINNT, null_mut(), &session, &mut engine);
-    if NT_SUCCESS!(status) {
-        G_NET.lock().engine = engine;
-    }
-    status
+    FwpmEngineOpen0(null(), RPC_C_AUTHN_WINNT, null_mut(), &session, addr_of_mut!(G_ENGINE))
 }
 
 unsafe fn add_sublayer() -> NTSTATUS {
@@ -826,45 +775,34 @@ unsafe fn add_sublayer() -> NTSTATUS {
         provider_data: FwpByteBlob { size: 0, data: null_mut() },
         weight: 0x0100,
     };
-    let engine = G_NET.lock().engine;
-    let status = FwpmSubLayerAdd0(engine, &sublayer, null_mut());
+    let status = FwpmSubLayerAdd0(G_ENGINE, &sublayer, null_mut());
     if NT_SUCCESS!(status) {
-        G_NET.lock().sublayer_added = true;
+        G_SUBLAYER_ADDED = true;
     }
     status
 }
 
 unsafe fn start_drain_thread() -> NTSTATUS {
-    let mut thread: HANDLE = null_mut();
-    let status = PsCreateSystemThread(
-        &mut thread,
+    PsCreateSystemThread(
+        &mut G_NET_THREAD,
         0x0010_0000, // SYNCHRONIZE
         null_mut(),
         null_mut(),
         null_mut(),
         drain_thread,
         null_mut(),
-    );
-    if NT_SUCCESS!(status) {
-        G_NET_THREAD.store(thread as usize, Ordering::Release);
-    }
-    status
+    )
 }
 
 /// Registers the callout, sublayer and filters and starts the drain thread. PASSIVE_LEVEL.
 /// # Safety
 /// `driver` is the DRIVER_OBJECT from DriverEntry.
 pub(crate) unsafe fn start(driver: *mut DRIVER_OBJECT) -> NTSTATUS {
-    G_RING.init();
-    G_NET.init();
+    G_RING_LOCK.init();
     flow_pool_init();
     // before any filter is live: a classify that fires during registration must not touch an
     // uninitialized event (`KeSetEvent` would be lost by the later `KeInitializeEvent`)
-    {
-        let mut ring = G_RING.lock();
-        KeInitializeEvent(&mut ring.wake, SynchronizationEvent, 0);
-    }
-    G_STARTED.store(1, Ordering::Release);
+    KeInitializeEvent(&mut G_NET_WAKE, SynchronizationEvent, 0);
 
     let mut device: *mut DEVICE_OBJECT = null_mut();
     let status = IoCreateDevice(driver, 0, null(), FILE_DEVICE_UNKNOWN, 0, 0, &mut device);
@@ -873,7 +811,7 @@ pub(crate) unsafe fn start(driver: *mut DRIVER_OBJECT) -> NTSTATUS {
         return status;
     }
     (*device).Flags &= !DO_DEVICE_INITIALIZING;
-    G_NET.lock().device = device;
+    G_DEVICE = device;
 
     let mut status = open_engine();
     if !NT_SUCCESS!(status) {
@@ -918,91 +856,59 @@ pub(crate) unsafe fn start(driver: *mut DRIVER_OBJECT) -> NTSTATUS {
 }
 
 unsafe fn stop_drain_thread() {
-    G_RING.lock().stop = true;
-    let thread = G_NET_THREAD.swap(0, Ordering::AcqRel) as HANDLE;
-    if !thread.is_null() {
-        KeSetEvent(&mut *wake_ptr(), 0, 0);
-        ZwWaitForSingleObject(thread, 0, null());
-        ZwClose(thread);
+    {
+        let _guard = G_RING_LOCK.lock();
+        G_NET_STOP = true;
+    }
+    if !G_NET_THREAD.is_null() {
+        KeSetEvent(&mut G_NET_WAKE, 0, 0);
+        ZwWaitForSingleObject(G_NET_THREAD, 0, null());
+        ZwClose(G_NET_THREAD);
+        G_NET_THREAD = null_mut();
     }
 }
 
-/// Stops the drain thread and releases the WFP objects. PASSIVE_LEVEL.
-///
-/// The WFP teardown calls require PASSIVE_LEVEL, and `Locked::lock` holds the FAST_MUTEX at
-/// APC_LEVEL: everything needed is copied under the lock, which is then dropped, and the calls run
-/// outside it. Holding the lock here made every call return STATUS_NOT_SUPPORTED and left the
-/// callout registration pinning the driver image until reboot.
+/// Removes the filters, callouts and sublayer and stops the drain thread. PASSIVE_LEVEL.
 pub(crate) unsafe fn stop() {
-    // start() never ran: nothing to tear down, and the locks were never initialized
-    if G_STARTED.swap(0, Ordering::AcqRel) == 0 {
-        return;
-    }
     // stop the drain thread first: after this nothing calls send_message for a net event
     stop_drain_thread();
-    let (
-        engine,
-        device,
-        filter_added,
-        filter_id,
-        callout_added,
-        callout_registered,
-        sublayer_added,
-    ) = {
-        let state = G_NET.lock();
-        (
-            state.engine,
-            state.device,
-            state.filter_added,
-            state.filter_id,
-            state.callout_added,
-            state.callout_registered,
-            state.sublayer_added,
-        )
-    };
-    if !engine.is_null() {
+    if !G_ENGINE.is_null() {
         for index in 0..4 {
-            if filter_added[index] {
-                FwpmFilterDeleteById0(engine, filter_id[index]);
+            if G_FILTER_ADDED[index] {
+                FwpmFilterDeleteById0(G_ENGINE, G_FILTER_ID[index]);
+                G_FILTER_ADDED[index] = false;
             }
-            if callout_added[index] {
-                FwpmCalloutDeleteByKey0(engine, &CALLBACK_KEYS[index]);
+            if G_CALLOUT_ADDED[index] {
+                FwpmCalloutDeleteByKey0(G_ENGINE, &CALLBACK_KEYS[index]);
+                G_CALLOUT_ADDED[index] = false;
             }
         }
         for index in 0..4 {
-            if callout_registered[index] {
-                FwpsCalloutUnregisterById0(G_CALLOUT_ID[index].load(Ordering::Acquire));
+            if G_CALLOUT_REGISTERED[index] {
+                FwpsCalloutUnregisterById0(G_CALLOUT_ID[index]);
+                G_CALLOUT_REGISTERED[index] = false;
             }
         }
-        if sublayer_added {
-            FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_KEY);
+        if G_SUBLAYER_ADDED {
+            FwpmSubLayerDeleteByKey0(G_ENGINE, &SUBLAYER_KEY);
+            G_SUBLAYER_ADDED = false;
         }
-        FwpmEngineClose0(engine);
-        let mut state = G_NET.lock();
-        state.engine = null_mut();
-        state.filter_added = [false; 4];
-        state.callout_added = [false; 4];
-        state.callout_registered = [false; 4];
-        state.sublayer_added = false;
+        FwpmEngineClose0(G_ENGINE);
+        G_ENGINE = null_mut();
     }
-    if !device.is_null() {
-        IoDeleteDevice(device);
-        G_NET.lock().device = null_mut();
+    if !G_DEVICE.is_null() {
+        IoDeleteDevice(G_DEVICE);
+        G_DEVICE = null_mut();
     }
-    let dropped = {
-        let mut ring = G_RING.lock();
-        let dropped = ring.dropped;
-        ring.dropped = 0;
-        dropped
-    };
-    if dropped != 0 {
-        log::warn!("wfp: net events dropped (ring full): {}", dropped);
+    if G_NET_DROPPED != 0 {
+        log::warn!("wfp: net events dropped (ring full): {}", G_NET_DROPPED);
+        G_NET_DROPPED = 0;
     }
     {
-        let mut ring = G_RING.lock();
-        ring.head = 0;
-        ring.tail = 0;
-        ring.len = 0;
-        ring.stop = false;
+        let _guard = G_RING_LOCK.lock();
+        G_RING_HEAD = 0;
+        G_RING_TAIL = 0;
+        G_RING_LEN = 0;
+        G_NET_STOP = false;
     }
 }

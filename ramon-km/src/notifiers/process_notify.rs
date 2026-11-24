@@ -16,7 +16,7 @@ use winapi::{
     shared::{ntdef::HANDLE, ntstatus::STATUS_INSUFFICIENT_RESOURCES},
 };
 
-use crate::{np_alloc::NonPaged, send_message::send_message, spinlock::SpinLocked};
+use crate::{np_alloc::NonPaged, send_message::send_message, spinlock::SpinLock};
 
 // not declared in km-api-sys
 extern "system" {
@@ -25,31 +25,34 @@ extern "system" {
 
 // The WFP callout reads the tag at DISPATCH_LEVEL, so the tree lives in NonPaged pool and is
 // protected by a spinlock instead of a FAST_MUTEX (which is illegal above APC_LEVEL).
-static G_TREE: SpinLocked<ProcessTree<NonPaged>> = SpinLocked::new(ProcessTree::new_in(NonPaged));
+pub(crate) static mut G_TREE_MUTEX: SpinLock = SpinLock::new();
+static mut G_TREE: ProcessTree<NonPaged> = ProcessTree::new_in(NonPaged);
 
 /// Initializes the tree lock; call once from DriverEntry before any callback can run.
 pub(crate) unsafe fn init_tree() {
-    G_TREE.init();
+    G_TREE_MUTEX.init();
 }
 
 /// Frees the tree; call only after the process notify routine is removed.
 pub(crate) unsafe fn clear_tree() {
-    *G_TREE.lock() = ProcessTree::new_in(NonPaged);
+    let _locker = G_TREE_MUTEX.lock();
+    G_TREE = ProcessTree::new_in(NonPaged);
 }
 
 pub(crate) unsafe fn session_tag_of(pid: u32) -> Option<SessionTag> {
-    G_TREE.lock().tag_of(pid)
+    let _locker = G_TREE_MUTEX.lock();
+    G_TREE.tag_of(pid)
 }
 
 // processes tagged by one adoption whose SessionAssigned is sent; the rest are only logged
 const MAX_ASSIGNED: usize = 64;
 
 pub(crate) unsafe fn adopt(child: ProcessKey, causal: ProcessKey) -> bool {
-    adopt_then_send(|assigned| G_TREE.lock().adopt(child, causal, assigned))
+    adopt_then_send(|assigned| G_TREE.adopt(child, causal, assigned))
 }
 
 pub(crate) unsafe fn adopt_tag(child: ProcessKey, tag: SessionTag) -> bool {
-    adopt_then_send(|assigned| G_TREE.lock().adopt_tag(child, tag, assigned))
+    adopt_then_send(|assigned| G_TREE.adopt_tag(child, tag, assigned))
 }
 
 // send_message can block on a full queue, so it runs after the tree lock is released
@@ -59,6 +62,7 @@ unsafe fn adopt_then_send(
     let mut keys = [ProcessKey { pid: 0, create_time: 0 }; MAX_ASSIGNED];
     let mut len = 0;
     let tag = {
+        let _locker = G_TREE_MUTEX.lock();
         adopt(&mut |key, _| {
             if len < MAX_ASSIGNED {
                 keys[len] = key;
@@ -111,13 +115,16 @@ pub extern "system" fn OnProcessNotify(
             let path = image_file_name.as_rust_string().unwrap_or_default();
             let command_line = command_line(create_info.CommandLine);
 
-            let session = G_TREE.lock().on_create(
-                key,
-                HandleToU32!(create_info.ParentProcessId),
-                HandleToU32!(create_info.CreatingThreadId.UniqueProcess),
-                &path,
-                &command_line,
-            );
+            let session = {
+                let _locker = G_TREE_MUTEX.lock();
+                G_TREE.on_create(
+                    key,
+                    HandleToU32!(create_info.ParentProcessId),
+                    HandleToU32!(create_info.CreatingThreadId.UniqueProcess),
+                    &path,
+                    &command_line,
+                )
+            };
             let session = match session {
                 Ok(session) => session,
                 // an untracked agent descendant would escape its session: deny it
@@ -138,7 +145,8 @@ pub extern "system" fn OnProcessNotify(
             );
             send_message(event.serialize().unwrap_or_default());
         } else {
-            G_TREE.lock().on_exit(key);
+            let _locker = G_TREE_MUTEX.lock();
+            G_TREE.on_exit(key);
         }
     }
 }

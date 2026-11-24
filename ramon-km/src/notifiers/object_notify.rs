@@ -19,8 +19,7 @@ use winapi::{
 };
 
 use crate::{
-    locked::Locked, notifiers::process_notify::session_tag_of, send_message::send_message,
-    unicode_string,
+    notifiers::process_notify::session_tag_of, send_message::send_message, unicode_string,
 };
 
 // not declared in km-api-sys
@@ -75,38 +74,26 @@ struct ObCallbackRegistration {
     operation_registration: *const ObOperationRegistration,
 }
 
-// ObRegisterCallbacks keeps a pointer to the altitude buffer and the registration, so both live in
-// kernel static memory. The callback never takes this lock.
-struct Registration {
-    operations: [ObOperationRegistration; 1],
-    registration: ObCallbackRegistration,
-    handle: PVOID,
-}
-
-static G_STATE: Locked<Registration> = Locked::new(Registration {
-    operations: [unsafe { mem::zeroed() }],
-    registration: unsafe { mem::zeroed() },
-    handle: null_mut(),
-});
+// ObRegisterCallbacks keeps a pointer to the altitude buffer, so both live in kernel static memory
+static mut G_OPERATIONS: [ObOperationRegistration; 1] = [unsafe { mem::zeroed() }];
+static mut G_REGISTRATION: ObCallbackRegistration = unsafe { mem::zeroed() };
+static mut G_HANDLE: PVOID = null_mut();
 
 pub(crate) unsafe fn start() -> NTSTATUS {
-    G_STATE.init();
-    let mut state = G_STATE.lock();
-    state.operations[0].object_type = PsProcessType;
-    state.operations[0].operations = OB_OPERATION_HANDLE_CREATE;
-    state.operations[0].pre_operation = Some(OnProcessHandlePreOp);
-    state.registration.version = OB_FLT_REGISTRATION_VERSION;
-    state.registration.operation_registration_count = 1;
-    state.registration.altitude = unicode_string(OB_ALTITUDE);
-    state.registration.operation_registration = state.operations.as_ptr();
-    ObRegisterCallbacks(&state.registration, &mut state.handle)
+    G_OPERATIONS[0].object_type = PsProcessType;
+    G_OPERATIONS[0].operations = OB_OPERATION_HANDLE_CREATE;
+    G_OPERATIONS[0].pre_operation = Some(OnProcessHandlePreOp);
+    G_REGISTRATION.version = OB_FLT_REGISTRATION_VERSION;
+    G_REGISTRATION.operation_registration_count = 1;
+    G_REGISTRATION.altitude = unicode_string(OB_ALTITUDE);
+    G_REGISTRATION.operation_registration = G_OPERATIONS.as_ptr();
+    ObRegisterCallbacks(&G_REGISTRATION, &mut G_HANDLE)
 }
 
 pub(crate) unsafe fn stop() {
-    let mut state = G_STATE.lock();
-    if !state.handle.is_null() {
-        ObUnRegisterCallbacks(state.handle);
-        state.handle = null_mut();
+    if !G_HANDLE.is_null() {
+        ObUnRegisterCallbacks(G_HANDLE);
+        G_HANDLE = null_mut();
     }
 }
 
