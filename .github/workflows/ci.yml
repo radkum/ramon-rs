@@ -5,13 +5,18 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # pinned in rust-toolchain.toml too; the WDK/libm shims are checked against this exact nightly
+  TOOLCHAIN: nightly-2026-05-08
+
 jobs:
   host:
-    # the driver needs the WDK; the host crates do not, so this job runs on a normal runner
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
       - name: Test ariadne and common
         run: cargo test -p ariadne -p common
       - name: Build the client
@@ -21,8 +26,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.TOOLCHAIN }}
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all --check
@@ -32,8 +38,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.TOOLCHAIN }}
           components: rust-src
       - name: Download the WDK kernel libraries
         shell: pwsh

@@ -336,14 +336,6 @@ version = "0.1.0"
 source = "git+https://github.com/radkum/kernel-btree.git#01dec8ac55e0c787265b293fa9552d8d9399ebfa"
 
 [[package]]
-name = "kernel-fast-mutex"
-version = "0.1.0"
-source = "git+https://github.com/radkum/windows-kernel-rs.git#57cd6d738ca5ba19a8ceb18dc03d62d67f6533ff"
-dependencies = [
- "km-api-sys",
-]
-
-[[package]]
 name = "kernel-init"
 version = "0.1.0"
 source = "git+https://github.com/radkum/windows-kernel-rs.git#57cd6d738ca5ba19a8ceb18dc03d62d67f6533ff"
@@ -487,14 +479,12 @@ dependencies = [
  "ariadne",
  "common",
  "kernel-btree",
- "kernel-fast-mutex",
  "kernel-init",
  "kernel-macros",
  "kernel-string",
  "km-api-sys",
  "log",
  "winapi 0.3.7",
- "windows-sys 0.52.0",
  "winreg",
 ]
 
