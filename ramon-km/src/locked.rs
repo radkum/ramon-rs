@@ -16,6 +16,10 @@ use km_api_sys::wmd::{ExAcquireFastMutex, ExInitializeFastMutex, ExReleaseFastMu
 
 pub(crate) struct Locked<T> {
     lock: UnsafeCell<FAST_MUTEX>,
+    // debug builds fail loudly when a static is locked before init(); a zeroed FAST_MUTEX would
+    // otherwise wait on a zeroed KEVENT and bugcheck (0xA)
+    #[cfg(debug_assertions)]
+    initialized: core::sync::atomic::AtomicBool,
     data: UnsafeCell<T>,
 }
 
@@ -27,7 +31,12 @@ unsafe impl<T> Sync for Locked<T> {}
 
 impl<T> Locked<T> {
     pub(crate) const fn new(data: T) -> Self {
-        Self { lock: UnsafeCell::new(FAST_MUTEX::new()), data: UnsafeCell::new(data) }
+        Self {
+            lock: UnsafeCell::new(FAST_MUTEX::new()),
+            #[cfg(debug_assertions)]
+            initialized: core::sync::atomic::AtomicBool::new(false),
+            data: UnsafeCell::new(data),
+        }
     }
 
     /// Initializes the mutex. Call once at PASSIVE_LEVEL before any callback can lock it:
@@ -36,10 +45,17 @@ impl<T> Locked<T> {
     /// # Safety
     /// Must be called exactly once, before any other thread can reach this value.
     pub(crate) unsafe fn init(&self) {
-        ExInitializeFastMutex(&mut *self.lock.get())
+        ExInitializeFastMutex(&mut *self.lock.get());
+        #[cfg(debug_assertions)]
+        self.initialized.store(true, core::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn lock(&self) -> LockedGuard<'_, T> {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.initialized.load(core::sync::atomic::Ordering::Acquire),
+            "Locked::lock before init()"
+        );
         let lock = self.lock.get();
         // SAFETY: the guard holds the mutex until it is dropped, and a second `lock()` blocks in
         // `ExAcquireFastMutex` before it can form its own reference, so the `&mut T` is unique.

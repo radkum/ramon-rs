@@ -99,6 +99,8 @@ fn events() -> (*mut KEVENT, *mut KEVENT) {
 }
 
 pub(crate) unsafe fn start_sender() -> NTSTATUS {
+    // a zeroed FAST_MUTEX is "locked": acquiring it waits on a zeroed KEVENT and bugchecks (0xA)
+    G_SENDER.init();
     let mut sender = G_SENDER.lock();
     if sender.queue.try_reserve_exact(QUEUE_LEN).is_err()
         || sender.spare.try_reserve_exact(QUEUE_LEN).is_err()
