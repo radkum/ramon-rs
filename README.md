@@ -122,13 +122,37 @@ growth on a kernel path is fallible. `build-std` makes `compiler-builtins` refer
 `fma`/`fmaf`, which a `/NODEFAULTLIB` driver does not link; `ramon-km/src/libm_shim.rs` provides
 non-fused definitions only to satisfy the linker (the driver performs no floating-point math).
 
-Load only on a test machine with test signing enabled:
+## Trying it
+
+The driver is unsigned for release: load it only on a test machine. Enable test signing once
+(`bcdedit /set testsigning on`, reboot), trust the signing certificate, then put `ramon.sys` and
+`ramon-client.exe` next to the scripts:
 
 ```
-fltmc load ramon
-ramon-client.exe all
-fltmc unload ramon
+ps> .\scripts\install.ps1        # service + instance altitude + fltmc load
+ps> .\ramon-client.exe all       # prints events until Ctrl+C
+ps> .\scripts\uninstall.ps1      # unload + remove the service and the driver file
 ```
+
+`scripts\smoke.ps1` does the whole cycle: install, run the client for a few seconds, count the
+events it received, unload, and fail if no event arrived or if a new bugcheck was recorded.
+
+Reinstalling on the same boot can fail at the copy step (see limit 8): the previously loaded image
+can stay mapped, so reboot before replacing `ramon.sys`.
+
+A real capture from a Windows 11 VM (client output, first lines after connecting):
+
+```
+SUCCESS! Client connected to driver
+Some(ImageLoadEvent { pid: 3784, image_base: 140713424125952, image_size: 196608, path: "\\Device\\HarddiskVolume3\\Windows\\System32\\ncrypt.dll" })
+Some(ImageLoadEvent { pid: 3784, image_base: 140713295740928, image_size: 548864, path: "\\Device\\HarddiskVolume3\\Windows\\System32\\FWPUCLNT.DLL" })
+Some(ProcessCreateEvent { pid: 6276, parent_id: 2976, create_time: 134399983997759131, path: "\\??\\C:\\WINDOWS\\SystemApps\\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\\CrossDeviceResume.exe", session: None, command_line: "\"C:\\WINDOWS\\SystemApps\\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\\CrossDeviceResume.exe\" /tileid MicrosoftWindows.Client.CBS_cw5n1h2txyewy!CrossDeviceResumeApp" })
+Some(RegistrySetValueEvent { pid: 4788, tid: 4808, key_name: "\\REGISTRY\\MACHINE\\SYSTEM\\ControlSet001\\Services\\bam\\State\\UserSettings\\S-1-5-21-...", value_name: "MicrosoftWindows.Client.CBS_cw5n1h2txyewy", data_type: 3, data: [164, 134, 255, 199, 18, 124, 221, 1, 0, 0, 0, 0] })
+...
+```
+
+In that run the filter attached to four volumes and the client received 713 events in ~5 s
+(image loads, process creates, registry writes). `fltmc filters` showed `ramon` at altitude 345102.
 
 ## Limits (not production)
 
@@ -160,7 +184,11 @@ This is an example. What that means concretely:
 6. **Scope.** x64 only. No policy, no blocking except guardrail denies and Mirage redirection (both
    opt-in over the port), no persistence of state across reboot, no self-protection (the driver is
    not PPL/ELAM), no signature.
-7. **Mirage and MOTA are detection aids, not boundaries.** Mirage hides a decoy from one process
+7. **WFP teardown is unfinished.** The minifilter unloads cleanly, but in the lab run the WFP
+   sublayer/callout/filter objects were still present after unload: the callout registration keeps
+   the driver image mapped, so `ramon.sys` cannot be replaced until a reboot. The teardown calls'
+   return codes are ignored - this is the next thing to fix in `net::stop`.
+8. **Mirage and MOTA are detection aids, not boundaries.** Mirage hides a decoy from one process
    tree by rewriting the create path; a determined caller can reach the file by other means. MOTA
    keys on `FileId`, so it sees reopens but not a copy made through an untagged process first.
 

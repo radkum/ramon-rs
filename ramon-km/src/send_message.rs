@@ -8,7 +8,7 @@
 use alloc::vec::Vec;
 use core::{
     mem,
-    ptr::{null, null_mut},
+    ptr::{addr_of, null, null_mut},
 };
 
 use kernel_macros::NT_SUCCESS;
@@ -153,10 +153,10 @@ pub(crate) fn send_message(event: Vec<u8>) {
         return;
     }
     let mut event = event;
-    let (wake, space) = events();
     loop {
         let mut pushed = false;
-        {
+        // one lock acquisition per iteration: the event pointers come from the same guard
+        let (wake, space) = {
             let mut sender = G_SENDER.lock();
             if sender.stop {
                 sender.dropped += 1;
@@ -171,6 +171,8 @@ pub(crate) fn send_message(event: Vec<u8>) {
                 },
                 Err(back) => event = back,
             }
+            let (wake, space) =
+                (addr_of!(sender.wake) as *mut KEVENT, addr_of!(sender.space) as *mut KEVENT);
             if !pushed {
                 if sender.delivering_since != 0 && now() - sender.delivering_since > STALL {
                     sender.dropped += 1;
@@ -178,7 +180,8 @@ pub(crate) fn send_message(event: Vec<u8>) {
                 }
                 unsafe { KeClearEvent(space) };
             }
-        }
+            (wake, space)
+        };
         unsafe { KeSetEvent(wake, 0, FALSE) };
         if pushed {
             return;

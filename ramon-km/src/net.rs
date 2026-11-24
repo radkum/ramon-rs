@@ -385,6 +385,8 @@ static G_RING: SpinLocked<NetRing> = SpinLocked::new(NetRing {
     wake: unsafe { mem::zeroed() },
 });
 static G_NET_THREAD: AtomicUsize = AtomicUsize::new(0);
+// set by start(): stop() must not lock an uninitialized state if the driver never started WFP
+static G_STARTED: AtomicUsize = AtomicUsize::new(0);
 
 // the event lives in the static for the driver's lifetime; the drain thread waits on it without
 // holding the spinlock
@@ -861,6 +863,7 @@ pub(crate) unsafe fn start(driver: *mut DRIVER_OBJECT) -> NTSTATUS {
         let mut ring = G_RING.lock();
         KeInitializeEvent(&mut ring.wake, SynchronizationEvent, 0);
     }
+    G_STARTED.store(1, Ordering::Release);
 
     let mut device: *mut DEVICE_OBJECT = null_mut();
     let status = IoCreateDevice(driver, 0, null(), FILE_DEVICE_UNKNOWN, 0, 0, &mut device);
@@ -925,6 +928,10 @@ unsafe fn stop_drain_thread() {
 
 /// Removes the filters, callouts and sublayer and stops the drain thread. PASSIVE_LEVEL.
 pub(crate) unsafe fn stop() {
+    // start() never ran: nothing to tear down, and the locks were never initialized
+    if G_STARTED.swap(0, Ordering::AcqRel) == 0 {
+        return;
+    }
     // stop the drain thread first: after this nothing calls send_message for a net event
     stop_drain_thread();
     let mut state = G_NET.lock();
