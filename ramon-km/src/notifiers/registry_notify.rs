@@ -42,14 +42,11 @@ pub extern "system" fn OnRegistryNotify(_context: PVOID, arg1: PVOID, arg2: PVOI
                 return STATUS_SUCCESS;
             }
 
+            // copy the cookie out of the lock: the call below does not need the lock held
+            let cookie = *G_COOKIE.lock();
             let mut name: PUNICODE_STRING = null_mut();
-            let status = CmCallbackGetKeyObjectIDEx(
-                &G_COOKIE.lock(),
-                op_info.Object,
-                null_mut(),
-                &mut name,
-                0,
-            );
+            let status =
+                CmCallbackGetKeyObjectIDEx(&cookie, op_info.Object, null_mut(), &mut name, 0);
             if !NT_SUCCESS!(status) {
                 return STATUS_SUCCESS;
             }

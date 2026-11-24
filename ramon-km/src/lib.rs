@@ -200,7 +200,10 @@ pub(crate) unsafe fn unregister_notify_callbacks() {
 
     PsRemoveLoadImageNotifyRoutine(OnImageLoadNotify);
 
-    CmUnRegisterCallback(*G_COOKIE.lock());
+    // copy the cookie and release the lock first: CmUnRegisterCallback waits for in-flight
+    // registry callbacks, and one of them may be waiting for this lock
+    let cookie = *G_COOKIE.lock();
+    CmUnRegisterCallback(cookie);
 
     stop_object_notify();
 }

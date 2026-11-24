@@ -76,7 +76,9 @@ impl Minifilter {
 
             if !NT_SUCCESS!(status) {
                 log::info!("failed to init minifilter. Status: 0x{:08x}", status);
-                *S_MINIFILTER.lock() = None;
+                // take under the lock, drop outside it: Minifilter::drop calls FltUnregisterFilter
+                let failed = S_MINIFILTER.lock().take();
+                drop(failed);
             }
             status
         }
