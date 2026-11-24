@@ -5,3 +5,4 @@ target
 # test signing certificates and generated packages
 *.cer
 *.cat
+dist/
