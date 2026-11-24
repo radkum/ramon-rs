@@ -55,6 +55,9 @@ signing, no tests on the host. Read the [Limits](#limits-not-production) section
 - `ramon-km/src/mirage.rs` — a decoy visible only to the tagged process: the file object name is
   replaced in pre-create (`IoReplaceFileObjectName` + `FltSetCallbackDataDirty`), so the read is
   served from a decoy file.
+- `ramon-km/src/locked.rs` — `Locked<T>`: static state without `static mut`. The data is reachable
+  only through the guard returned by `lock()`, and the guard releases the `FAST_MUTEX` on drop, so
+  no `&mut T` can be aliased and no module needs a `static_mut_refs` allowance.
 - `ramon-km/src/send_message.rs` — a queue between callbacks and a single sender system thread, so a
   slow client never runs inside a callback.
 
@@ -131,10 +134,15 @@ fltmc unload ramon
 
 This is an example. What that means concretely:
 
-1. **Global state.** All module state lives in `static mut` behind one global `FAST_MUTEX`. That is
-   one driver instance, no per-volume or per-client isolation, and no cleanup ordering beyond the
-   unload callback. A production driver would hang the same state off the filter/instance contexts
-   (`FltAllocateContext`) or the device object.
+1. **Global state.** State is process-wide: one driver instance, no per-volume or per-client
+   isolation, and no cleanup ordering beyond the unload callback. `guardrail`, `mirage`, `mota` and
+   `section_sync` keep it in `Locked<T>` (`src/locked.rs`: a `FAST_MUTEX` and its data, reachable
+   only through a guard), so those modules have no `static mut` and no `static_mut_refs` allowance.
+   `net` (the WFP ring and flow pool), `send_message` (the queue and sender thread state),
+   `object_notify`, `minifilter`, `lib` and `process_notify` still use `static mut` with an explicit
+   lock around every access; those are the next candidates for the same treatment. A production
+   driver would hang the same state off the filter/instance contexts (`FltAllocateContext`) or the
+   device object.
 2. **A stuck client costs up to 10 s.** When the 32768-entry queue is full, callbacks wait for
    space; if one event has been waiting longer than `STALL` (10 s), the event is dropped and counted
    (`G_DROPPED`). A production sensor would drop at once or disconnect the client. A *disconnected*

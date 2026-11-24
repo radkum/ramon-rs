@@ -14,12 +14,11 @@ use common::{
     event::{canary::CanaryEvent, mirage_redirect::MirageRedirectEvent, Event},
     utils::{try_extend, try_push_str, try_to_string},
 };
-use kernel_fast_mutex::{auto_lock::AutoLock, fast_mutex::FastMutex, locker::Locker};
 use kernel_macros::NT_SUCCESS;
 use km_api_sys::{flt_kernel::FLT_CALLBACK_DATA, wmd::KeGetCurrentIrql};
 use winapi::shared::ntdef::{NTSTATUS, PVOID, USHORT};
 
-use crate::send_message::send_message;
+use crate::{locked::Locked, send_message::send_message};
 
 extern "system" {
     fn IoReplaceFileObjectName(
@@ -38,19 +37,31 @@ const DEFAULT_SUFFIX: &str = ".mirage";
 // a decoy suffix is a short marker; the client config is capped to this many bytes
 const MAX_SUFFIX: usize = 64;
 
-static mut G_MUTEX: FastMutex = FastMutex::new();
-static mut G_PATTERNS: Vec<u8> = Vec::new();
-static mut G_SUFFIX: [u8; MAX_SUFFIX] = [0; MAX_SUFFIX];
-static mut G_SUFFIX_LEN: usize = 0;
-// paths and session roots where Mirage does not apply: a legal deploy needs the real credentials
-static mut G_EXCEPT_PATHS: Vec<u8> = Vec::new();
-static mut G_EXCEPT_SESSIONS: Vec<(u32, u64)> = Vec::new();
+struct Config {
+    patterns: Vec<u8>,
+    suffix: [u8; MAX_SUFFIX],
+    suffix_len: usize,
+    // paths and session roots where Mirage does not apply: a legal deploy needs the real credentials
+    except_paths: Vec<u8>,
+    except_sessions: Vec<(u32, u64)>,
+}
+
+static G_CONFIG: Locked<Config> = Locked::new(Config {
+    patterns: Vec::new(),
+    suffix: [0; MAX_SUFFIX],
+    suffix_len: 0,
+    except_paths: Vec::new(),
+    except_sessions: Vec::new(),
+});
 
 /// Applies the built-in defaults at load, so decoys work before a client connects.
 pub(crate) unsafe fn init() {
-    G_MUTEX.Init();
-    G_EXCEPT_PATHS = Vec::new();
-    G_EXCEPT_SESSIONS = Vec::new();
+    G_CONFIG.init();
+    {
+        let mut config = G_CONFIG.lock();
+        config.except_paths = Vec::new();
+        config.except_sessions = Vec::new();
+    }
     set(DEFAULT_PATTERNS.iter().copied(), DEFAULT_SUFFIX);
 }
 
@@ -71,9 +82,9 @@ pub(crate) unsafe fn set_exceptions<'a>(
             }
         }
     }
-    let _locker = AutoLock::new(&mut G_MUTEX);
-    G_EXCEPT_PATHS = paths;
-    G_EXCEPT_SESSIONS = parsed;
+    let mut config = G_CONFIG.lock();
+    config.except_paths = paths;
+    config.except_sessions = parsed;
 }
 
 pub(crate) unsafe fn set<'a>(patterns: impl Iterator<Item = &'a str>, suffix: &str) {
@@ -87,10 +98,10 @@ pub(crate) unsafe fn set<'a>(patterns: impl Iterator<Item = &'a str>, suffix: &s
     }
     let mut buf = [0u8; MAX_SUFFIX];
     buf[..len].copy_from_slice(&bytes[..len]);
-    let _locker = AutoLock::new(&mut G_MUTEX);
-    G_PATTERNS = patterns;
-    G_SUFFIX = buf;
-    G_SUFFIX_LEN = len;
+    let mut config = G_CONFIG.lock();
+    config.patterns = patterns;
+    config.suffix = buf;
+    config.suffix_len = len;
 }
 
 // on allocation failure a fragment is dropped: the config is best-effort, never panics
@@ -106,19 +117,20 @@ fn join_fragments<'a>(fragments: impl Iterator<Item = &'a str>) -> Vec<u8> {
 /// True when a tagged read of `name` must be redirected to a decoy. The pre-op calls this only for a
 /// tagged read: a decoy itself never matches, and an exempt path or session reads the real file.
 pub(crate) unsafe fn should_redirect(name: &str, session: SessionTag) -> bool {
-    let _locker = AutoLock::new(&mut G_MUTEX);
+    let config = G_CONFIG.lock();
     // a decoy is not a secret: the agent is meant to read it, and it must not match its own pattern
-    if G_SUFFIX_LEN != 0 && ends_with_ignore_ascii_case(name.as_bytes(), &G_SUFFIX[..G_SUFFIX_LEN])
+    if config.suffix_len != 0
+        && ends_with_ignore_ascii_case(name.as_bytes(), &config.suffix[..config.suffix_len])
     {
         return false;
     }
-    if !matches_any(&G_PATTERNS, name) {
+    if !matches_any(&config.patterns, name) {
         return false;
     }
-    if matches_any(&G_EXCEPT_PATHS, name) {
+    if matches_any(&config.except_paths, name) {
         return false;
     }
-    !G_EXCEPT_SESSIONS.iter().any(|(pid, create_time)| {
+    !config.except_sessions.iter().any(|(pid, create_time)| {
         session.root.pid == *pid && session.root.create_time == *create_time
     })
 }
@@ -144,9 +156,9 @@ fn ends_with_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
 // so the file object's device is still right); `None` when the suffix is empty or a copy fails
 fn decoy_path(path: &str) -> Option<String> {
     // copy the suffix out of the lock: the allocation below must not run while holding it
-    let (buf, len) = unsafe {
-        let _locker = AutoLock::new(&mut G_MUTEX);
-        (G_SUFFIX, G_SUFFIX_LEN)
+    let (buf, len) = {
+        let config = G_CONFIG.lock();
+        (config.suffix, config.suffix_len)
     };
     if len == 0 {
         return None;

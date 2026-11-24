@@ -15,6 +15,7 @@ mod guardrail;
 mod ioctl_code;
 mod irp;
 mod libm_shim;
+mod locked;
 mod logger;
 mod minifilter;
 mod mirage;
