@@ -7,6 +7,8 @@
 #![feature(allocator_api)]
 #![feature(vec_push_within_capacity)]
 #![allow(non_snake_case)]
+// the driver keeps its state in Locked/SpinLocked; do not let a new `static mut` slip in
+#![deny(static_mut_refs)]
 
 mod cleaner;
 
