@@ -1,0 +1,8 @@
+[workspace]
+members = ["ramon-km", "ramon-client", "common", "ariadne", "xtask"]
+# the driver needs the WDK and its own link flags; build it from ramon-km/ (see README)
+default-members = ["ramon-client", "common", "ariadne"]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1"

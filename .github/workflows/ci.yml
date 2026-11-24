@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  host:
+    # the driver needs the WDK; the host crates do not, so this job runs on a normal runner
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test ariadne and common
+        run: cargo test -p ariadne -p common
+      - name: Build the client
+        run: cargo build -p ramon-client
+
+  fmt:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check

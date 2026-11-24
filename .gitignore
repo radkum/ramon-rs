@@ -1,0 +1,7 @@
+/.idea/
+target
+/output/
+
+# test signing certificates and generated packages
+*.cer
+*.cat
