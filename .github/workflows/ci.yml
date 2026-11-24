@@ -26,3 +26,24 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all --check
+
+  driver:
+    # the WDK NuGet package provides the kernel import libraries, so the kit is not installed
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Download the WDK kernel libraries
+        shell: pwsh
+        run: |
+          $version = '10.0.26100.6584'
+          $url = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/$version/microsoft.windows.wdk.x64.$version.nupkg"
+          Invoke-WebRequest $url -OutFile wdk.zip
+          Expand-Archive wdk.zip -DestinationPath C:\wdk
+      - name: Build the driver
+        working-directory: ramon-km
+        env:
+          WDK_ROOT: C:\wdk\c
+        run: cargo build

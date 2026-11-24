@@ -6,7 +6,14 @@ use std::{
 use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
 
 /// `C:\Program Files (x86)\Windows Kits\10`.
+///
+/// `WDK_ROOT` overrides the registry lookup so CI can build against the WDK NuGet packages
+/// (`Microsoft.Windows.WDK.x64`) without installing the kit: set it to the package's `c`
+/// directory, which contains `Lib\<version>\km\<arch>`.
 fn read_kits_path() -> PathBuf {
+    if let Ok(dir) = var("WDK_ROOT") {
+        return PathBuf::from(dir);
+    }
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let key = r"SOFTWARE\Microsoft\Windows Kits\Installed Roots";
     let dir: String = hklm.open_subkey(key).unwrap().get_value("KitsRoot10").unwrap();
@@ -56,6 +63,8 @@ fn get_kernel_library_dir() -> PathBuf {
 }
 
 fn main() {
+    // the WDK root may come from the registry or WDK_ROOT; rerun when it changes
+    println!("cargo:rerun-if-env-changed=WDK_ROOT");
     let km_dir = get_kernel_library_dir();
     println!("cargo:rustc-link-search=native={}", km_dir.to_str().unwrap());
 }
