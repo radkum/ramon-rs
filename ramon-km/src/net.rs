@@ -387,6 +387,8 @@ static G_RING: SpinLocked<NetRing> = SpinLocked::new(NetRing {
 static G_NET_THREAD: AtomicUsize = AtomicUsize::new(0);
 // set by start(): stop() must not lock an uninitialized state if the driver never started WFP
 static G_STARTED: AtomicUsize = AtomicUsize::new(0);
+// a fresh WFP session key per load, so a reload in the same boot never collides with the old session
+static G_SESSION_SEQ: AtomicU32 = AtomicU32::new(0);
 
 // the event lives in the static for the driver's lifetime; the drain thread waits on it without
 // holding the spinlock
@@ -926,7 +928,12 @@ unsafe fn stop_drain_thread() {
     }
 }
 
-/// Removes the filters, callouts and sublayer and stops the drain thread. PASSIVE_LEVEL.
+/// Stops the drain thread and releases the WFP objects. PASSIVE_LEVEL.
+///
+/// The WFP teardown calls require PASSIVE_LEVEL, and `Locked::lock` holds the FAST_MUTEX at
+/// APC_LEVEL: everything needed is copied under the lock, which is then dropped, and the calls run
+/// outside it. Holding the lock here made every call return STATUS_NOT_SUPPORTED and left the
+/// callout registration pinning the driver image until reboot.
 pub(crate) unsafe fn stop() {
     // start() never ran: nothing to tear down, and the locks were never initialized
     if G_STARTED.swap(0, Ordering::AcqRel) == 0 {
@@ -934,36 +941,55 @@ pub(crate) unsafe fn stop() {
     }
     // stop the drain thread first: after this nothing calls send_message for a net event
     stop_drain_thread();
-    let mut state = G_NET.lock();
-    if !state.engine.is_null() {
+    let (
+        engine,
+        device,
+        filter_added,
+        filter_id,
+        callout_added,
+        callout_registered,
+        sublayer_added,
+    ) = {
+        let state = G_NET.lock();
+        (
+            state.engine,
+            state.device,
+            state.filter_added,
+            state.filter_id,
+            state.callout_added,
+            state.callout_registered,
+            state.sublayer_added,
+        )
+    };
+    if !engine.is_null() {
         for index in 0..4 {
-            if state.filter_added[index] {
-                FwpmFilterDeleteById0(state.engine, state.filter_id[index]);
-                state.filter_added[index] = false;
+            if filter_added[index] {
+                FwpmFilterDeleteById0(engine, filter_id[index]);
             }
-            if state.callout_added[index] {
-                FwpmCalloutDeleteByKey0(state.engine, &CALLBACK_KEYS[index]);
-                state.callout_added[index] = false;
+            if callout_added[index] {
+                FwpmCalloutDeleteByKey0(engine, &CALLBACK_KEYS[index]);
             }
         }
         for index in 0..4 {
-            if state.callout_registered[index] {
+            if callout_registered[index] {
                 FwpsCalloutUnregisterById0(G_CALLOUT_ID[index].load(Ordering::Acquire));
-                state.callout_registered[index] = false;
             }
         }
-        if state.sublayer_added {
-            FwpmSubLayerDeleteByKey0(state.engine, &SUBLAYER_KEY);
-            state.sublayer_added = false;
+        if sublayer_added {
+            FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_KEY);
         }
-        FwpmEngineClose0(state.engine);
+        FwpmEngineClose0(engine);
+        let mut state = G_NET.lock();
         state.engine = null_mut();
+        state.filter_added = [false; 4];
+        state.callout_added = [false; 4];
+        state.callout_registered = [false; 4];
+        state.sublayer_added = false;
     }
-    if !state.device.is_null() {
-        IoDeleteDevice(state.device);
-        state.device = null_mut();
+    if !device.is_null() {
+        IoDeleteDevice(device);
+        G_NET.lock().device = null_mut();
     }
-    drop(state);
     let dropped = {
         let mut ring = G_RING.lock();
         let dropped = ring.dropped;
