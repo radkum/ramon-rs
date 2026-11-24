@@ -38,21 +38,22 @@ that was never initialized (the static-mut refactor dropped the `G_MUTEX.Init()`
 bugchecked. Fixed by calling `init()` before the first lock; debug builds now assert it
 (`Locked` has an `initialized` flag checked with `debug_assert!`).
 
-## Open issue: WFP teardown
+## WFP teardown (fixed) and the remaining reload limitation
 
-The teardown calls require PASSIVE_LEVEL, but `net::stop` holds the state `FAST_MUTEX` (APC_LEVEL),
-so every WFP call returns `STATUS_NOT_SUPPORTED` (`0xC00000BB`, measured by writing the statuses to
-the registry). The sublayer, callout objects and filters stay in BFE and the callout registration
-keeps the driver image mapped, so `ramon.sys` cannot be replaced until a reboot.
+The teardown calls must run at PASSIVE_LEVEL, but `net::stop` was holding the state `FAST_MUTEX`
+(APC_LEVEL), so every WFP call returned `STATUS_NOT_SUPPORTED` (`0xC00000BB`, measured by writing the
+statuses to the registry). The sublayer, callout objects and filters stayed in BFE and the callout
+registration kept the driver image mapped, so `ramon.sys` could not be replaced until a reboot.
 
-A variant that copies what it needs under the lock and calls WFP after releasing it does clean BFE
-(0 sublayer / 0 callout / 0 filter) and releases the image - but in the lab the VM then bugchecked
-**0xCE (DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS)** at unload, twice (same parameter,
-two different boots). Something is still pending against the driver object when the image unloads;
-the teardown statuses are ignored, so a callout that failed to unregister is the likely candidate.
-The variant was reverted. Next step: a kernel-debugger session (WinDbg/kd over a Hyper-V pipe) to
-dump the pending object, then either retry/verify every teardown call or move the WFP teardown out
-of the filter unload callback.
+Fix: copy what is needed under the lock, drop it, then call WFP. Measured after one load + client +
+unload in the lab: service stopped, `fltmc filters` empty, `netsh wfp show state` shows 0 sublayer /
+0 callout / 0 filter, and `ramon.sys` can be opened for write (image released). The unload step was
+verified with a stage counter written to the registry after every call (`NetStopStage` reached the
+final step).
+
+Remaining: a **second** load in the same boot (re-registering the callouts after the first teardown)
+hung the lab VM twice, so it is not solved. A boot
+marker in `install.ps1` refuses a second load and asks for a reboot.
 ## Driver Verifier
 
 `verifier /standard /driver C:\Windows\System32\drivers\ramon.sys` (special pool, force IRQL
@@ -68,6 +69,6 @@ returned from `fltmc unload` with 0 and unregistered the filter.
 
 ## Not done yet
 
-- A long load/unload loop - blocked by the WFP issue above (each cycle needs a reboot).
+- A long load/unload loop - blocked by the reload issue above (each cycle needs a reboot).
 - Fuzzing of `common`'s deserializer (the host tests cover truncated/garbage input only).
 - Any test on real hardware or a non-VM machine.
