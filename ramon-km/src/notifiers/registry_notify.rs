@@ -56,12 +56,12 @@ pub extern "system" fn OnRegistryNotify(_context: PVOID, arg1: PVOID, arg2: PVOI
                 return STATUS_UNSUCCESSFUL;
             }
 
-            loop {
+            'notify: {
                 let key_name = if let Some(key_name) = (*name).as_rust_string() {
                     key_name
                 } else {
                     log::info!("Something wrong. Can't convert \"key_name\" to rust string");
-                    break;
+                    break 'notify;
                 };
                 let registry_machine = "\\REGISTRY\\MACHINE";
 
@@ -69,7 +69,7 @@ pub extern "system" fn OnRegistryNotify(_context: PVOID, arg1: PVOID, arg2: PVOI
                 if key_name.contains(registry_machine) {
                     if op_info.PreInformation.is_null() {
                         //something wrong
-                        break;
+                        break 'notify;
                     }
 
                     let pre_info = &*(op_info.PreInformation as PREG_SET_VALUE_KEY_INFORMATION);
@@ -78,17 +78,17 @@ pub extern "system" fn OnRegistryNotify(_context: PVOID, arg1: PVOID, arg2: PVOI
                             value_name
                         } else {
                             //log::info!("Something wrong. Can't convert \"value_name\" to rust string");
-                            break;
+                            break 'notify;
                         };
 
                     if pre_info.Data.is_null() {
-                        break;
+                        break 'notify;
                     }
 
                     // Data may be a user buffer that another thread frees: MmCopyMemory fails instead of faulting
                     let size = pre_info.DataSize.min(0x400) as usize;
                     let Ok(mut data) = try_filled(size, 0u8) else {
-                        break;
+                        break 'notify;
                     };
                     let mut copied = 0;
                     if size != 0
@@ -100,7 +100,7 @@ pub extern "system" fn OnRegistryNotify(_context: PVOID, arg1: PVOID, arg2: PVOI
                             &mut copied,
                         )) || copied != size)
                     {
-                        break;
+                        break 'notify;
                     }
                     let event = RegistrySetValueEvent::new(
                         HandleToU32!(PsGetCurrentProcessId()),
@@ -121,7 +121,7 @@ pub extern "system" fn OnRegistryNotify(_context: PVOID, arg1: PVOID, arg2: PVOI
                     //     data: v.clone(),
                     // };
                 }
-                break;
+                break 'notify;
             }
             CmCallbackReleaseKeyObjectIDEx(name);
         }

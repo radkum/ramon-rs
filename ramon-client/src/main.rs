@@ -2,6 +2,7 @@ mod detection;
 pub mod error;
 mod error_msg;
 mod handle_wrapper;
+mod rade_detection;
 pub mod winapi;
 
 use std::{env, ffi::OsString};

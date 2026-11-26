@@ -117,6 +117,15 @@ process named `ramon-client` (all-zero 64-byte proof, size 0, size 32) were refu
 `0x80070005`, the real client connected, and the unload stayed clean (no bugcheck, no minidumps);
 the full `test-baseline` finished with no FAIL.
 
+`RamonPreCreate` hands the name it already resolved to `RamonPostCreate` through the pre-op
+completion context, so a tagged create resolves the name once (no per-file-object state; an earlier
+persistent stream-handle cache was dropped because its contexts lived as long as the file object and
+grew the pool after a burst of creates). `RamonInstanceSetup` refuses network and CD-ROM volumes
+(`STATUS_FLT_DO_NOT_ATTACH`) and keeps an `FLT_INSTANCE_CONTEXT` with the volume device type; files
+on network shares and CD-ROM media are therefore not monitored. The lab filter instance count dropped
+from 4 to 3. Driver Verifier `/standard` (flags `0x001209bb`) over a full load/client/unload cycle:
+8/8 checks, no bugcheck, no minidumps, no verifier violations.
+
 ## Driver Verifier
 
 `verifier /standard /driver C:\Windows\System32\drivers\ramon.sys` (special pool, force IRQL

@@ -229,7 +229,8 @@ impl FileMonitor {
         }
         // hand the resolved name to post-create so a tagged create resolves it once
         unsafe {
-            *completion_context = crate::create_handoff::into_completion((file_name, extension));
+            *completion_context =
+                crate::create_handoff::into_completion((file_name, extension));
         }
         FLT_PREOP_SUCCESS_WITH_CALLBACK
     }
@@ -242,7 +243,7 @@ impl FileMonitor {
     ) -> FLT_POSTOP_CALLBACK_STATUS {
         // take the name handed by pre-create; the Box is dropped (freed) on every early return
         let completion = unsafe { crate::create_handoff::take_completion(completion_context) };
-        let mut ntstatus = unsafe { data.IoStatus.__bindgen_anon_1.Status().clone() };
+        let mut ntstatus = unsafe { *data.IoStatus.__bindgen_anon_1.Status() };
         // the file was not opened, or the instance is being torn down
         if !NT_SUCCESS!(ntstatus)
             || ntstatus == STATUS_REPARSE
@@ -347,7 +348,7 @@ impl FileMonitor {
         if flags & FLTFL_POST_OPERATION_DRAINING != 0 {
             return FLT_POSTOP_FINISHED_PROCESSING;
         }
-        let ntstatus = unsafe { data.IoStatus.__bindgen_anon_1.Status().clone() };
+        let ntstatus = unsafe { *data.IoStatus.__bindgen_anon_1.Status() };
         let irql = u64::from(unsafe { KeGetCurrentIrql() });
         // a paging write (memory-mapped writeback) runs in a system thread, often at DISPATCH, without a
         // session tag: it cannot be reported here, so mark the remembered section for a later drain
@@ -665,7 +666,7 @@ fn target_name_utf16(info: &FLT_PARAMETERS_SET_FILE_INFORMATION) -> Option<&[u16
     }
     let buffer = info.InfoBuffer as *const RenameInfoBuffer;
     let length = unsafe { (*buffer).file_name_length } as usize;
-    if length == 0 || length % 2 != 0 || length > (info.Length as usize) - RENAME_NAME_OFFSET {
+    if length == 0 || !length.is_multiple_of(2) || length > (info.Length as usize) - RENAME_NAME_OFFSET {
         return None;
     }
     Some(unsafe {
@@ -712,11 +713,11 @@ fn parse_name_info(
     flt_objects: &mut FLT_RELATED_OBJECTS,
 ) -> Option<(String, String, Option<String>)> {
     let mut result = None;
-    loop {
+    'parse: {
         let ntstatus = unsafe { FltParseFileNameInformation(pfile_name_info) };
         if !NT_SUCCESS!(ntstatus) {
             log::warn!("FltParseFileNameInformation failed. Err: 0x{:08x}", ntstatus);
-            break;
+            break 'parse;
         }
 
         let mut p_volume = null_mut();
@@ -725,7 +726,7 @@ fn parse_name_info(
         };
         if !NT_SUCCESS!(ntstatus) {
             log::warn!("FltGetVolumeFromFileObject failed. Err: 0x{:08x}", ntstatus);
-            break;
+            break 'parse;
         }
 
         let mut buffer_size: ULONG = 0;
@@ -733,7 +734,7 @@ fn parse_name_info(
         let _ = unsafe { FltGetVolumeGuidName(p_volume, null_mut(), &mut buffer_size) };
         let Ok(mut guid_buffer) = try_filled(buffer_size as usize / 2, 0u16) else {
             unsafe { FltObjectDereference(p_volume) };
-            break;
+            break 'parse;
         };
         // buffer is owned by guid_buffer; UNICODE_STRING's Drop would RtlFreeUnicodeString it
         let mut guid_name = ManuallyDrop::new(UNICODE_STRING {
@@ -748,7 +749,7 @@ fn parse_name_info(
         unsafe { FltObjectDereference(p_volume) };
         if !NT_SUCCESS!(ntstatus) {
             log::debug!("FltGetVolumeGuidName failed. Err: 0x{:08x}", ntstatus);
-            break;
+            break 'parse;
         }
 
         let file_name_info = unsafe { &*pfile_name_info };
@@ -760,45 +761,45 @@ fn parse_name_info(
             //log::warn!("{} -{}-{}", guid_name, volume, name);
             if let Some(stripped) = name.strip_prefix(&volume) {
                 if try_push_str(&mut guid_name, stripped).is_err() {
-                    break;
+                    break 'parse;
                 }
                 let Ok(relative) = try_to_string(stripped) else {
-                    break;
+                    break 'parse;
                 };
                 let extension = file_name_info.Extension.as_rust_string();
                 result = Some((guid_name, relative, extension));
             }
         }
         //log::warn!("guid_name {:?}", guid_name.as_rust_string());
-        break;
+        break 'parse;
     }
     result
 }
 
 impl FileMonitor {
     fn ProcessFileEvent(file_name: String) {
-        log::trace!("file_name: {}", &file_name);
+        log::trace!("file_name: {}", file_name);
 
         let event = FileCreateEvent::new(file_name);
         send_message(event.serialize().unwrap_or_default());
     }
 
     fn ProcessFileTelemetryEvent(pid: u32, session: SessionTag, intent: u8, file_name: String) {
-        log::trace!("file telemetry: {}", &file_name);
+        log::trace!("file telemetry: {}", file_name);
 
         let event = FileTelemetryEvent::new(pid, session, intent, file_name);
         send_message(event.serialize().unwrap_or_default());
     }
 
     fn ProcessCanaryEvent(pid: u32, session: SessionTag, file_name: String) {
-        log::trace!("canary: {}", &file_name);
+        log::trace!("canary: {}", file_name);
 
         let event = CanaryEvent::new(pid, session, file_name);
         send_message(event.serialize().unwrap_or_default());
     }
 
     fn ProcessFileSetInformationEvent(pid: u32, session: SessionTag, kind: u8, file_name: String) {
-        log::trace!("file set information: {}", &file_name);
+        log::trace!("file set information: {}", file_name);
 
         let event = FileSetInformationEvent::new(pid, session, kind, file_name);
         send_message(event.serialize().unwrap_or_default());
@@ -810,7 +811,7 @@ impl FileMonitor {
         kind: u8,
         file_name: String,
     ) {
-        log::trace!("guardrail blocked: {}", &file_name);
+        log::trace!("guardrail blocked: {}", file_name);
 
         let event = GuardrailBlockedEvent::new(pid, session, kind, file_name);
         send_message(event.serialize().unwrap_or_default());

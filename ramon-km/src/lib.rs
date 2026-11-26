@@ -40,8 +40,7 @@ extern crate alloc;
 use core::ptr::null_mut;
 
 /// kernel-init deliver a few elements (eg. panic implementation) necessary to run code in kernel
-#[allow(unused_imports)]
-use kernel_init;
+use kernel_init as _;
 use kernel_macros::NT_SUCCESS;
 use kernel_string::UNICODE_STRING;
 use km_api_sys::{
@@ -102,6 +101,11 @@ static G_NOTIFY: Locked<NotifyState> = Locked::new(NotifyState {
     object_removed: false,
 });
 
+/// Driver entry point: registers the notify callbacks, the communication port and the sender
+/// thread.
+///
+/// # Safety
+/// Called by the I/O manager with a valid `driver` object.
 #[link_section = "INIT"]
 #[no_mangle]
 pub unsafe extern "system" fn DriverEntry(
@@ -135,11 +139,11 @@ pub unsafe extern "system" fn DriverEntry(
     let mut status = STATUS_SUCCESS;
 
     let mut cleaner = Cleaner::new();
-    loop {
+    'init: {
         status = send_message::start_sender();
         if !NT_SUCCESS!(status) {
             log::info!("failed to start sender thread 0x{:08x}", status);
-            break;
+            break 'init;
         }
 
         //--------------------PROCESS NOTIFY-----------------------
@@ -149,7 +153,7 @@ pub unsafe extern "system" fn DriverEntry(
             cleaner.init_process_create_callback(OnProcessNotify);
         } else {
             log::info!("failed to create process nofity rountine 0x{:08x}", status);
-            break;
+            break 'init;
         }
 
         //--------------------IMAGE NOTIFY-----------------------
@@ -159,7 +163,7 @@ pub unsafe extern "system" fn DriverEntry(
             cleaner.init_image_load_callback(OnImageLoadNotify);
         } else {
             log::info!("failed to create image load routine 0x{:08x}", status);
-            break;
+            break 'init;
         }
 
         //--------------------REGISTRY NOTIFY-----------------------
@@ -182,7 +186,7 @@ pub unsafe extern "system" fn DriverEntry(
             cleaner.init_registry_callback(cookie);
         } else {
             log::info!("failed to create registry routine 0x{:08x}", status);
-            break;
+            break 'init;
         }
 
         //--------------------OBJECT NOTIFY (process handle opens)-----------------------
@@ -192,12 +196,12 @@ pub unsafe extern "system" fn DriverEntry(
             cleaner.init_object_callback();
         } else {
             log::info!("failed to register object callbacks 0x{:08x}", status);
-            break;
+            break 'init;
         }
 
         //#[allow(unused_assignments)]
         status = Minifilter::create(driver);
-        break;
+        break 'init;
     }
 
     //clean if initialization failed

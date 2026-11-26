@@ -56,18 +56,29 @@ use crate::{
     unicode_string,
 };
 
+#[allow(clippy::upper_case_acronyms)]
 pub(crate) type PMINIFILTER = *mut Minifilter;
 pub(crate) static S_MINIFILTER: Locked<Option<Box<Minifilter>>> = Locked::new(None);
 static INSTANCE_NUMBER: AtomicUsize = AtomicUsize::new(0);
-// the nonce of the last accepted handshake, so a captured connect context cannot be replayed
-static LAST_NONCE: Locked<[u8; handshake::NONCE_LEN]> = Locked::new([0u8; handshake::NONCE_LEN]);
+
+// the nonces of the last few accepted handshakes, so a captured connect context cannot be replayed
+// while it is still recent
+const RECENT_NONCES: usize = 8;
+
+struct Nonces {
+    ring: [[u8; handshake::NONCE_LEN]; RECENT_NONCES],
+    next: usize,
+}
+
+static G_NONCES: Locked<Nonces> =
+    Locked::new(Nonces { ring: [[0u8; handshake::NONCE_LEN]; RECENT_NONCES], next: 0 });
 
 /// Initializes the slot before the sender thread exists: `deliver` may run while the notify
 /// callbacks registered in `DriverEntry` are already producing events, and a zeroed FAST_MUTEX
 /// is "locked" (bugcheck 0xA on the first acquire).
 pub(crate) unsafe fn init() {
     S_MINIFILTER.init();
-    LAST_NONCE.init();
+    G_NONCES.init();
 }
 
 pub(crate) struct Minifilter {
@@ -206,15 +217,17 @@ impl Minifilter {
             return STATUS_ACCESS_DENIED;
         }
 
-        // a proof accepted once must not be accepted again: reject a replayed connect context
+        // a proof accepted once must not be accepted again: reject a recent nonce
         {
             let nonce = handshake::proof_nonce(&proof);
-            let mut last = LAST_NONCE.lock();
-            if *last == *nonce {
+            let mut nonces = G_NONCES.lock();
+            if nonces.ring.iter().any(|seen| seen == nonce) {
                 log::warn!("client port: replayed handshake nonce");
                 return STATUS_ACCESS_DENIED;
             }
-            last.copy_from_slice(nonce);
+            let index = nonces.next;
+            nonces.ring[index] = *nonce;
+            nonces.next = (index + 1) % RECENT_NONCES;
         }
 
         let minifilter = server_port_cookie as PMINIFILTER;
@@ -290,11 +303,11 @@ impl Minifilter {
 
         #[allow(unused_assignments)]
         let mut status = STATUS_SUCCESS;
-        loop {
+        'comm: {
             status = FltBuildDefaultSecurityDescriptor(&mut port_security, FLT_PORT_ALL_ACCESS);
             if !NT_SUCCESS!(status) {
                 log::warn!("failed to build security descriptor. Status: {}", status);
-                break;
+                break 'comm;
             }
 
             InitializeObjectAttributes(
@@ -317,12 +330,12 @@ impl Minifilter {
             );
             if !NT_SUCCESS!(status) {
                 log::warn!("failed to create comm port. Status: {}", status);
-                break;
+                break 'comm;
             }
 
             log::info!("SUCCESS to create comm port. Port name: {}", port_name);
             log::info!("SUCCESS to create comm port. Port name (degug): {:?}", port_name);
-            break;
+            break 'comm;
         }
         //cleanup
         if !port_security.is_null() {
@@ -437,7 +450,7 @@ impl Drop for Minifilter {
     MiniFilter initialization and unload routines.
 *************************************************************************/
 
-const CALLBACKS: &'static [FLT_OPERATION_REGISTRATION] = {
+const CALLBACKS: &[FLT_OPERATION_REGISTRATION] = {
     const IRP_MJ_WRITE: u8 = 0x04;
     // FltMgr operations (fltKernel.h): (UCHAR)-1 / (UCHAR)-2
     const IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION: u8 = 0xff;

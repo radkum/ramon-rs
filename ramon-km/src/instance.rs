@@ -82,11 +82,13 @@ pub(crate) unsafe fn attach(flt_objects: &FLT_RELATED_OBJECTS, device_type: u32)
     true
 }
 
-/// Frees the per-instance context.
+/// Frees the per-instance context, logging the volume device type it carried.
 pub(crate) unsafe fn detach(flt_objects: &FLT_RELATED_OBJECTS) {
     let mut old: PVOID = null_mut();
     FltDeleteInstanceContext(flt_objects.Instance, &mut old);
     if !old.is_null() {
+        let device_type = (*(old as *const InstanceContext)).device_type;
+        log::info!("instance: detaching device type 0x{:x}", device_type);
         FltReleaseContext(old);
     }
 }
