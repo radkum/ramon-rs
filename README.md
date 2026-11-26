@@ -1,6 +1,6 @@
 # RAMON
 
-**Edition 2 of 2 - AI-assisted rewrite and extension (2026).** This edition was rebuilt and extended with an AI assistant. The original, hand-written 2025 minifilter is preserved at [adkum/ramon-rs-legacy](https://github.com/radkum/ramon-rs-legacy).
+**Edition 2 of 2 - AI-assisted rewrite and extension (2026).** This edition was rebuilt and extended with an AI assistant. The original, hand-written 2025 minifilter is preserved at [`radkum/ramon-rs-legacy`](https://github.com/radkum/ramon-rs-legacy).
 
 A Windows kernel sensor written in Rust: a minifilter plus process, image-load, registry, handle-open
 and WFP callouts, streaming structured events to a user-mode client over a minifilter communication
@@ -213,12 +213,24 @@ callbacks and the protocol, not as the component.
 
 | Edition | Year | How it was written | Repository |
 |---|---|---|---|
-| 1 | 2025 | By hand, no AI | [adkum/ramon-rs-legacy](https://github.com/radkum/ramon-rs-legacy) |
+| 1 | 2025 | By hand, no AI | [`radkum/ramon-rs-legacy`](https://github.com/radkum/ramon-rs-legacy) |
 | 2 | 2026 | AI-assisted rewrite and extension | this repository |
 
 Edition 1 is the original minifilter prototype (file-create, process, image-load and registry
 events over a minifilter communication port). This edition keeps that protocol and extends it with
 the techniques described above.
+## Who wrote what
+
+Edition 1 (`ramon-rs-legacy`) is hand-written: I designed it and wrote every line.
+
+This edition was built with an AI assistant. I set the architecture, the invariants and the
+acceptance criteria (no `static mut`, fallible allocation on kernel paths, explicit IRQL contracts,
+one sender thread, a bounded queue, ordered teardown), and I directed and reviewed the changes. The
+assistant drafted most of the code, tests and documentation. The lab evidence used to accept the
+work - Driver Verifier, two load/unload cycles in one boot, the forged-handshake test - is recorded
+in [docs/verification.md](docs/verification.md).
+
+If you want to see what I write without an assistant, read Edition 1.
 ## Provenance
 
 Started as the `ramon-rs` example, built on [`windows-kernel-rs`](https://github.com/radkum/windows-kernel-rs)
