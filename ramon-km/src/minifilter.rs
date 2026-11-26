@@ -56,6 +56,7 @@ use crate::{
     unicode_string,
 };
 
+#[allow(clippy::upper_case_acronyms)]
 pub(crate) type PMINIFILTER = *mut Minifilter;
 pub(crate) static S_MINIFILTER: Locked<Option<Box<Minifilter>>> = Locked::new(None);
 static INSTANCE_NUMBER: AtomicUsize = AtomicUsize::new(0);
@@ -290,11 +291,11 @@ impl Minifilter {
 
         #[allow(unused_assignments)]
         let mut status = STATUS_SUCCESS;
-        loop {
+        'comm: {
             status = FltBuildDefaultSecurityDescriptor(&mut port_security, FLT_PORT_ALL_ACCESS);
             if !NT_SUCCESS!(status) {
                 log::warn!("failed to build security descriptor. Status: {}", status);
-                break;
+                break 'comm;
             }
 
             InitializeObjectAttributes(
@@ -317,12 +318,12 @@ impl Minifilter {
             );
             if !NT_SUCCESS!(status) {
                 log::warn!("failed to create comm port. Status: {}", status);
-                break;
+                break 'comm;
             }
 
             log::info!("SUCCESS to create comm port. Port name: {}", port_name);
             log::info!("SUCCESS to create comm port. Port name (degug): {:?}", port_name);
-            break;
+            break 'comm;
         }
         //cleanup
         if !port_security.is_null() {
@@ -437,7 +438,7 @@ impl Drop for Minifilter {
     MiniFilter initialization and unload routines.
 *************************************************************************/
 
-const CALLBACKS: &'static [FLT_OPERATION_REGISTRATION] = {
+const CALLBACKS: &[FLT_OPERATION_REGISTRATION] = {
     const IRP_MJ_WRITE: u8 = 0x04;
     // FltMgr operations (fltKernel.h): (UCHAR)-1 / (UCHAR)-2
     const IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION: u8 = 0xff;

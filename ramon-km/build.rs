@@ -31,7 +31,7 @@ fn find_km_dir(windows_kits_dir: &PathBuf) -> PathBuf {
         .map(|dir| dir.path())
         .filter(|dir| {
             dir.components()
-                .last()
+                .next_back()
                 .and_then(|c| c.as_os_str().to_str())
                 .map(|c| c.starts_with("10.") && dir.join("km").is_dir())
                 .unwrap_or(false)
