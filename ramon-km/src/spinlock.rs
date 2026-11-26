@@ -1,7 +1,8 @@
-//! A minimal spinlock, so state read from a callout at DISPATCH_LEVEL can be protected without the
-//! FAST_MUTEX (which may only be acquired at IRQL <= APC_LEVEL). `KSPIN_LOCK` is a `ULONG_PTR`, zeroed
-//! when unlocked, so a zero-initialized static is already valid; `init` is kept for symmetry.
-#![allow(static_mut_refs)]
+//! A spinlock that owns its state, so state read from a callout at DISPATCH_LEVEL is protected without
+//! the FAST_MUTEX (which may only be acquired at IRQL <= APC_LEVEL). `KSPIN_LOCK` is a `ULONG_PTR`,
+//! zeroed when unlocked, so a zero-initialized static is already valid.
+
+use core::cell::UnsafeCell;
 
 // not declared in km-api-sys
 extern "system" {
@@ -11,33 +12,62 @@ extern "system" {
     fn KeReleaseSpinLock(spin_lock: *mut usize, new_irql: u8);
 }
 
-/// A kernel spinlock. Use [`SpinLock::lock`]; the returned guard releases on drop.
-pub(crate) struct SpinLock(usize);
+/// A spinlock together with the state it protects: the state is reachable only through the guard,
+/// which restores the previous IRQL when dropped. Use for state read at DISPATCH_LEVEL.
+pub(crate) struct SpinLocked<T> {
+    lock: UnsafeCell<usize>,
+    data: UnsafeCell<T>,
+}
 
-impl SpinLock {
-    pub(crate) const fn new() -> Self {
-        Self(0)
+// SAFETY: every access to `data` goes through `lock()`, and the spinlock raises IRQL to DISPATCH,
+// so only one `&mut T` can exist at a time.
+unsafe impl<T> Sync for SpinLocked<T> {}
+
+impl<T> SpinLocked<T> {
+    pub(crate) const fn new(data: T) -> Self {
+        Self { lock: UnsafeCell::new(0), data: UnsafeCell::new(data) }
     }
 
-    pub(crate) fn init(&mut self) {
-        unsafe { KeInitializeSpinLock(&mut self.0) };
+    pub(crate) fn init(&self) {
+        unsafe { KeInitializeSpinLock(self.lock.get()) };
     }
 
-    /// # Safety
-    /// The lock must outlive the guard; the caller must not block or page-fault while it is held.
-    pub(crate) unsafe fn lock(&mut self) -> SpinGuard {
-        let irql = KeAcquireSpinLockRaiseToDpc(&mut self.0);
-        SpinGuard { lock: &mut self.0 as *mut usize, irql }
+    /// The address of the protected state, for code that must not take the lock (a pointer handed
+    /// to the OS, or an event waited on outside the lock). Taking the lock gives the same address.
+    pub(crate) fn get_ptr(&self) -> *mut T {
+        self.data.get()
+    }
+
+    pub(crate) fn lock(&self) -> SpinLockedGuard<'_, T> {
+        unsafe {
+            let irql = KeAcquireSpinLockRaiseToDpc(self.lock.get());
+            SpinLockedGuard { data: &mut *self.data.get(), lock: self.lock.get(), irql }
+        }
     }
 }
 
-/// Releases the spinlock when dropped.
-pub(crate) struct SpinGuard {
+/// Exclusive access to the data of a [`SpinLocked`]; releases the spinlock when dropped.
+pub(crate) struct SpinLockedGuard<'a, T> {
+    data: &'a mut T,
     lock: *mut usize,
     irql: u8,
 }
 
-impl Drop for SpinGuard {
+impl<T> core::ops::Deref for SpinLockedGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.data
+    }
+}
+
+impl<T> core::ops::DerefMut for SpinLockedGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.data
+    }
+}
+
+impl<T> Drop for SpinLockedGuard<'_, T> {
     fn drop(&mut self) {
         unsafe { KeReleaseSpinLock(self.lock, self.irql) };
     }

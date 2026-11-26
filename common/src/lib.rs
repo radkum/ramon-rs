@@ -8,6 +8,7 @@ pub mod constants;
 pub mod deserializer;
 pub mod enums;
 pub mod event;
+pub mod handshake;
 #[cfg(feature = "client")]
 pub mod hasher;
 pub mod serializer;

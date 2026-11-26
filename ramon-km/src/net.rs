@@ -10,12 +10,12 @@
 //! decision. Blocking (`FWP_ACTION_BLOCK` on `ALE_AUTH_CONNECT`) is a separate product decision and
 //! would require terminating filters. The WFP API is not in `km-api-sys`, so the structures and
 //! functions are declared here against the WDK ABI (`fwpsk.h`/`fwpmk.h`).
-#![allow(static_mut_refs)]
 
 use core::{
     ffi::c_void,
     mem,
     ptr::{addr_of_mut, null, null_mut},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use ariadne::{AgentKind, ProcessKey, SessionTag};
@@ -30,11 +30,13 @@ use winapi::{
     km::wdm::{SynchronizationEvent, DEVICE_OBJECT, DRIVER_OBJECT, KEVENT},
     shared::{
         ntdef::{HANDLE, NTSTATUS, PVOID, TRUE},
-        ntstatus::STATUS_SUCCESS,
+        ntstatus::{STATUS_NOT_FOUND, STATUS_SUCCESS},
     },
 };
 
-use crate::{notifiers::session_tag_of, send_message::send_message, spinlock::SpinLock};
+use crate::{
+    locked::Locked, notifiers::session_tag_of, send_message::send_message, spinlock::SpinLocked,
+};
 
 // ---------------------------------------------------------------- WFP ABI
 
@@ -160,6 +162,7 @@ struct FwpsDiscardMetadata {
 }
 
 // only up to `process_id`; the rest of FWPS_INCOMING_METADATA_VALUES0 is not read
+#[allow(dead_code)]
 #[repr(C)]
 struct FwpsIncomingMetadata {
     current_metadata_values: u32,
@@ -227,12 +230,6 @@ extern "system" {
         callout_id: *mut u32,
     ) -> NTSTATUS;
     fn FwpsCalloutUnregisterById0(callout_id: u32) -> NTSTATUS;
-    fn FwpsFlowAssociateContext0(
-        flow_id: u64,
-        layer_id: u16,
-        callout_id: u32,
-        flow_context: u64,
-    ) -> NTSTATUS;
 }
 
 // not declared in km-api-sys
@@ -248,6 +245,7 @@ extern "system" {
     ) -> NTSTATUS;
     fn IoDeleteDevice(device: *mut DEVICE_OBJECT);
     fn KeSetEvent(event: *mut KEVENT, increment: i32, wait: u8) -> i32;
+    fn KeDelayExecutionThread(wait_mode: u32, alertable: u8, interval: *const i64) -> NTSTATUS;
     fn KeWaitForSingleObject(
         object: PVOID,
         reason: u32,
@@ -284,7 +282,6 @@ const FWPM_SESSION_FLAG_DYNAMIC: u32 = 0x0000_0001;
 const FWP_ACTION_CALLOUT_INSPECTION: u32 = 0x0000_6004;
 const FWP_ACTION_PERMIT: u32 = 0x0000_1002;
 const FWPS_RIGHT_ACTION_WRITE: u32 = 0x0000_0001;
-const FWPS_METADATA_FIELD_FLOW_HANDLE: u32 = 0x0000_0002;
 const FILE_DEVICE_UNKNOWN: u32 = 0x0000_0022;
 const DO_DEVICE_INITIALIZING: u32 = 0x0000_0080;
 
@@ -295,10 +292,6 @@ const FIELD_PROTOCOL: usize = 5;
 const FIELD_REMOTE_ADDRESS: usize = 6;
 const FIELD_REMOTE_PORT: usize = 7;
 const FIELD_DIRECTION: usize = 12;
-
-// layer indices (AUTH_V4, AUTH_V6, FLOW_V4, FLOW_V6)
-const AUTH_V4: usize = 0;
-const AUTH_V6: usize = 1;
 
 const ALE_AUTH_CONNECT_V4: Guid =
     guid(0xc38d_57d1, 0x05a7, 0x4c33, [0x90, 0x4f, 0x7f, 0xbc, 0xee, 0xe6, 0x0e, 0x82]);
@@ -362,28 +355,52 @@ const EMPTY_ENTRY: NetEntry = NetEntry {
     remote_port: 0,
 };
 
-static mut G_RING: [NetEntry; RING_LEN] = [EMPTY_ENTRY; RING_LEN];
-static mut G_RING_LOCK: SpinLock = SpinLock::new();
-static mut G_RING_HEAD: usize = 0;
-static mut G_RING_TAIL: usize = 0;
-static mut G_RING_LEN: usize = 0;
-static mut G_NET_DROPPED: u32 = 0;
-static mut G_NET_STOP: bool = false;
-static mut G_NET_WAKE: KEVENT = unsafe { mem::zeroed() };
-static mut G_NET_THREAD: HANDLE = null_mut();
+struct NetRing {
+    entries: [NetEntry; RING_LEN],
+    head: usize,
+    tail: usize,
+    len: usize,
+    dropped: u32,
+    stop: bool,
+    wake: KEVENT,
+}
 
+static G_RING: SpinLocked<NetRing> = SpinLocked::new(NetRing {
+    entries: [EMPTY_ENTRY; RING_LEN],
+    head: 0,
+    tail: 0,
+    len: 0,
+    dropped: 0,
+    stop: false,
+    // a zeroed KEVENT is valid only after KeInitializeEvent, which start() does before use
+    wake: unsafe { mem::zeroed() },
+});
+static G_NET_THREAD: AtomicUsize = AtomicUsize::new(0);
+// set by start(): stop() must not lock an uninitialized state if the driver never started WFP
+static G_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+// the event lives in the static for the driver's lifetime; the drain thread waits on it without
+// holding the spinlock
+fn wake_ptr() -> *mut KEVENT {
+    unsafe { addr_of_mut!((*G_RING.get_ptr()).wake) }
+}
+
+/// Runs at IRQL <= DISPATCH: only touches the ring under the spinlock.
 unsafe fn enqueue(entry: NetEntry) {
-    {
-        let _guard = G_RING_LOCK.lock();
-        if G_RING_LEN == RING_LEN {
-            G_NET_DROPPED = G_NET_DROPPED.wrapping_add(1);
+    let wake = {
+        let mut ring = G_RING.lock();
+        if ring.len == RING_LEN {
+            ring.dropped = ring.dropped.wrapping_add(1);
             return;
         }
-        G_RING[G_RING_HEAD] = entry;
-        G_RING_HEAD = (G_RING_HEAD + 1) % RING_LEN;
-        G_RING_LEN += 1;
-    }
-    KeSetEvent(&mut G_NET_WAKE, 0, 0);
+        let head = ring.head;
+        ring.entries[head] = entry;
+        ring.head = (head + 1) % RING_LEN;
+        ring.len += 1;
+        &mut ring.wake as *mut KEVENT
+    };
+    // raw pointer on purpose: concurrent classifies on different CPUs must not form `&mut`
+    KeSetEvent(wake, 0, 0);
 }
 
 extern "system" fn drain_thread(_context: PVOID) {
@@ -394,17 +411,18 @@ extern "system" fn drain_thread(_context: PVOID) {
 }
 
 unsafe fn drain_loop() {
+    let wake = wake_ptr();
     loop {
-        KeWaitForSingleObject(&mut G_NET_WAKE as *mut KEVENT as PVOID, 0, 0, 0, null());
+        KeWaitForSingleObject(wake as PVOID, 0, 0, 0, null());
         loop {
             let entry = {
-                let _guard = G_RING_LOCK.lock();
-                if G_RING_LEN == 0 {
+                let mut ring = G_RING.lock();
+                if ring.len == 0 {
                     None
                 } else {
-                    let entry = G_RING[G_RING_TAIL];
-                    G_RING_TAIL = (G_RING_TAIL + 1) % RING_LEN;
-                    G_RING_LEN -= 1;
+                    let entry = ring.entries[ring.tail];
+                    ring.tail = (ring.tail + 1) % RING_LEN;
+                    ring.len -= 1;
                     Some(entry)
                 }
             };
@@ -413,11 +431,7 @@ unsafe fn drain_loop() {
                 None => break,
             }
         }
-        let stop = {
-            let _guard = G_RING_LOCK.lock();
-            G_NET_STOP
-        };
-        if stop {
+        if G_RING.lock().stop {
             return;
         }
     }
@@ -438,98 +452,13 @@ fn emit(entry: NetEntry) {
     send_message(event.serialize().unwrap_or_default());
 }
 
-// ---------------------------------------------------------------- flow contexts
-
-// per-flow context: a small NonPaged slot pool, so a DISPATCH classify never allocates. The slot is
-// associated with the flow (`FwpsFlowAssociateContext0`) and handed back by the flow-delete callback.
-const FLOW_POOL: usize = 256;
-
-// the context is only carried by WFP for the flow's lifetime; the fields document what it holds
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-struct FlowContext {
-    session: SessionTag,
-    pid: u32,
-}
-
-const EMPTY_FLOW: FlowContext = FlowContext { session: EMPTY_SESSION, pid: 0 };
-
-static mut G_FLOW: [FlowContext; FLOW_POOL] = [EMPTY_FLOW; FLOW_POOL];
-static mut G_FLOW_FREE: [u16; FLOW_POOL] = [0; FLOW_POOL];
-static mut G_FLOW_TOP: usize = 0;
-static mut G_FLOW_LOCK: SpinLock = SpinLock::new();
-
-unsafe fn flow_pool_init() {
-    G_FLOW_LOCK.init();
-    let mut index = 0;
-    while index < FLOW_POOL {
-        G_FLOW_FREE[index] = index as u16;
-        index += 1;
-    }
-    G_FLOW_TOP = FLOW_POOL;
-}
-
-unsafe fn flow_alloc(session: SessionTag, pid: u32) -> *mut FlowContext {
-    let _guard = G_FLOW_LOCK.lock();
-    if G_FLOW_TOP == 0 {
-        return null_mut();
-    }
-    G_FLOW_TOP -= 1;
-    let index = G_FLOW_FREE[G_FLOW_TOP] as usize;
-    G_FLOW[index] = FlowContext { session, pid };
-    addr_of_mut!(G_FLOW[index])
-}
-
-unsafe fn flow_free(context: u64) {
-    if context == 0 {
-        return;
-    }
-    let base = addr_of_mut!(G_FLOW) as usize;
-    let slot = context as usize;
-    let size = mem::size_of::<FlowContext>();
-    if slot < base || slot >= base + FLOW_POOL * size || (slot - base) % size != 0 {
-        return;
-    }
-    let index = (slot - base) / size;
-    let _guard = G_FLOW_LOCK.lock();
-    if G_FLOW_TOP < FLOW_POOL {
-        G_FLOW_FREE[G_FLOW_TOP] = index as u16;
-        G_FLOW_TOP += 1;
-    }
-}
-
-extern "system" fn flow_delete(_layer_id: u16, _callout_id: u32, flow_context: u64) {
-    unsafe { flow_free(flow_context) };
-}
-
 // ---------------------------------------------------------------- classify
 
-// A tagged connect attempt remembers the session in a flow context (for the flow's lifetime). The
-// netflow event itself is emitted once, at ALE_FLOW_ESTABLISHED, from a fresh tag lookup (the flow
-// context is per-layer and not visible at the established layer).
-unsafe fn associate_flow(
-    existing_context: u64,
-    flow_handle: u64,
-    layer_id: u16,
-    callout_id: u32,
-    session: SessionTag,
-    pid: u32,
-) {
-    // a re-authorization of a flow we already associated must not leak a second slot
-    if existing_context != 0 || flow_handle == 0 {
-        return;
-    }
-    let context = flow_alloc(session, pid);
-    if context.is_null() {
-        return;
-    }
-    let status = FwpsFlowAssociateContext0(flow_handle, layer_id, callout_id, context as u64);
-    if !NT_SUCCESS!(status) {
-        // no flow-delete will arrive for a failed association: give the slot back now
-        log::debug!("wfp: FwpsFlowAssociateContext0 failed. Status: 0x{:08x}", status);
-        flow_free(context as u64);
-    }
-}
+// No flow contexts are associated. `FwpsCalloutUnregisterById0` returns STATUS_DEVICE_BUSY while
+// any flow still has a context from the callout, and the documented fix is FwpsFlowRemoveContext0
+// per flow - which would require tracking every live flow id. The context was never read (the
+// event carries a fresh tag lookup at ALE_FLOW_ESTABLISHED), so not associating one keeps the
+// unload deterministic and removes the only way the runtime callout could stay registered.
 
 fn value_u32(values: &[FwpsIncomingValue], index: usize) -> u32 {
     values.get(index).map_or(0, |value| value.value.data as u32)
@@ -562,7 +491,6 @@ unsafe fn classify_impl(
     classify_out: *mut FwpsClassifyOut,
     family: u8,
     established: bool,
-    flow_context: u64,
 ) {
     if in_fixed.is_null() || in_meta.is_null() || classify_out.is_null() {
         return;
@@ -574,46 +502,37 @@ unsafe fn classify_impl(
     if out.rights & FWPS_RIGHT_ACTION_WRITE != 0 {
         out.action_type = FWP_ACTION_PERMIT;
     }
+    // the ALE_AUTH_CONNECT layers only authorize the connection; nothing is remembered there
+    if !established {
+        return;
+    }
     let pid = meta.process_id as u32;
     if pid == 0 || fixed.incoming_value.is_null() {
         return;
     }
-    let values = core::slice::from_raw_parts(fixed.incoming_value, fixed.value_count as usize);
-
-    let session = match session_tag_of(pid) {
-        Some(session) => session,
-        None => return,
+    let Some(session) = session_tag_of(pid) else {
+        return;
     };
-
-    if established {
-        let direction = value_u32(values, FIELD_DIRECTION) as u8;
-        if direction != DIRECTION_OUTBOUND {
-            return;
-        }
-        let mut local_addr = [0u8; 16];
-        let mut remote_addr = [0u8; 16];
-        value_addr(values, FIELD_LOCAL_ADDRESS, family, &mut local_addr);
-        value_addr(values, FIELD_REMOTE_ADDRESS, family, &mut remote_addr);
-        enqueue(NetEntry {
-            pid,
-            session,
-            direction,
-            family,
-            protocol: value_u8(values, FIELD_PROTOCOL),
-            local_addr,
-            remote_addr,
-            local_port: value_u16(values, FIELD_LOCAL_PORT),
-            remote_port: value_u16(values, FIELD_REMOTE_PORT),
-        });
-    } else {
-        let callout_id = G_CALLOUT_ID[if family == 4 { AUTH_V4 } else { AUTH_V6 }];
-        let flow_handle = if meta.current_metadata_values & FWPS_METADATA_FIELD_FLOW_HANDLE != 0 {
-            meta.flow_handle
-        } else {
-            0
-        };
-        associate_flow(flow_context, flow_handle, fixed.layer_id, callout_id, session, pid);
+    let values = core::slice::from_raw_parts(fixed.incoming_value, fixed.value_count as usize);
+    let direction = value_u32(values, FIELD_DIRECTION) as u8;
+    if direction != DIRECTION_OUTBOUND {
+        return;
     }
+    let mut local_addr = [0u8; 16];
+    let mut remote_addr = [0u8; 16];
+    value_addr(values, FIELD_LOCAL_ADDRESS, family, &mut local_addr);
+    value_addr(values, FIELD_REMOTE_ADDRESS, family, &mut remote_addr);
+    enqueue(NetEntry {
+        pid,
+        session,
+        direction,
+        family,
+        protocol: value_u8(values, FIELD_PROTOCOL),
+        local_addr,
+        remote_addr,
+        local_port: value_u16(values, FIELD_LOCAL_PORT),
+        remote_port: value_u16(values, FIELD_REMOTE_PORT),
+    });
 }
 
 extern "system" fn classify_auth_v4(
@@ -621,10 +540,10 @@ extern "system" fn classify_auth_v4(
     meta: *const FwpsIncomingMetadata,
     _layer_data: *mut c_void,
     _filter: *const c_void,
-    flow_context: u64,
+    _flow_context: u64,
     out: *mut FwpsClassifyOut,
 ) {
-    unsafe { classify_impl(fixed, meta, out, 4, false, flow_context) };
+    unsafe { classify_impl(fixed, meta, out, 4, false) };
 }
 
 extern "system" fn classify_auth_v6(
@@ -632,10 +551,10 @@ extern "system" fn classify_auth_v6(
     meta: *const FwpsIncomingMetadata,
     _layer_data: *mut c_void,
     _filter: *const c_void,
-    flow_context: u64,
+    _flow_context: u64,
     out: *mut FwpsClassifyOut,
 ) {
-    unsafe { classify_impl(fixed, meta, out, 6, false, flow_context) };
+    unsafe { classify_impl(fixed, meta, out, 6, false) };
 }
 
 extern "system" fn classify_flow_v4(
@@ -646,7 +565,7 @@ extern "system" fn classify_flow_v4(
     _flow_context: u64,
     out: *mut FwpsClassifyOut,
 ) {
-    unsafe { classify_impl(fixed, meta, out, 4, true, 0) };
+    unsafe { classify_impl(fixed, meta, out, 4, true) };
 }
 
 extern "system" fn classify_flow_v6(
@@ -657,7 +576,7 @@ extern "system" fn classify_flow_v6(
     _flow_context: u64,
     out: *mut FwpsClassifyOut,
 ) {
-    unsafe { classify_impl(fixed, meta, out, 6, true, 0) };
+    unsafe { classify_impl(fixed, meta, out, 6, true) };
 }
 
 extern "system" fn notify(
@@ -670,22 +589,32 @@ extern "system" fn notify(
 
 const CLASSIFY_FNS: [FwpsClassifyFn; 4] =
     [classify_auth_v4, classify_auth_v6, classify_flow_v4, classify_flow_v6];
-// `FWP_CALLOUT_FLAG_CONDITIONAL_ON_FLOW` suppresses the first invocation at ALE_AUTH_CONNECT (the
-// callout then never sees a flow to associate a context with), so no callout sets it
 const CALLBACK_FLAGS: [u32; 4] = [0, 0, 0, 0];
-// only the ALE_AUTH_CONNECT callouts associate a flow context and release it on flow delete
-const CALLBACK_HAS_FLOW_DELETE: [bool; 4] = [true, true, false, false];
 
 // ---------------------------------------------------------------- registration
 
-static mut G_ENGINE: HANDLE = null_mut();
-static mut G_DEVICE: *mut DEVICE_OBJECT = null_mut();
-static mut G_SUBLAYER_ADDED: bool = false;
-static mut G_CALLOUT_ID: [u32; 4] = [0; 4];
-static mut G_CALLOUT_REGISTERED: [bool; 4] = [false; 4];
-static mut G_CALLOUT_ADDED: [bool; 4] = [false; 4];
-static mut G_FILTER_ADDED: [bool; 4] = [false; 4];
-static mut G_FILTER_ID: [u64; 4] = [0; 4];
+// registration state, touched only at load/unload (PASSIVE)
+struct NetState {
+    engine: HANDLE,
+    device: *mut DEVICE_OBJECT,
+    sublayer_added: bool,
+    callout_registered: [bool; 4],
+    callout_added: [bool; 4],
+    filter_added: [bool; 4],
+    filter_id: [u64; 4],
+}
+
+static G_NET: Locked<NetState> = Locked::new(NetState {
+    engine: null_mut(),
+    device: null_mut(),
+    sublayer_added: false,
+    callout_registered: [false; 4],
+    callout_added: [false; 4],
+    filter_added: [false; 4],
+    filter_id: [0; 4],
+});
+// the runtime callout ids returned by FwpsCalloutRegister0; read only on the unload path
+static G_CALLOUT_ID: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 
 unsafe fn register_callout(index: usize) -> NTSTATUS {
     let callout = FwpsCallout {
@@ -693,13 +622,15 @@ unsafe fn register_callout(index: usize) -> NTSTATUS {
         flags: CALLBACK_FLAGS[index],
         classify_fn: Some(CLASSIFY_FNS[index]),
         notify_fn: Some(notify),
-        flow_delete_fn: if CALLBACK_HAS_FLOW_DELETE[index] { Some(flow_delete) } else { None },
+        // no flow contexts are associated, so there is nothing to release on flow delete
+        flow_delete_fn: None,
     };
     let mut id = 0u32;
-    let status = FwpsCalloutRegister0(G_DEVICE as *mut c_void, &callout, &mut id);
+    let device = G_NET.lock().device;
+    let status = FwpsCalloutRegister0(device as *mut c_void, &callout, &mut id);
     if NT_SUCCESS!(status) {
-        G_CALLOUT_ID[index] = id;
-        G_CALLOUT_REGISTERED[index] = true;
+        G_CALLOUT_ID[index].store(id, Ordering::Release);
+        G_NET.lock().callout_registered[index] = true;
     }
     status
 }
@@ -712,11 +643,12 @@ unsafe fn add_callout(index: usize) -> NTSTATUS {
         provider_key: null_mut(),
         provider_data: FwpByteBlob { size: 0, data: null_mut() },
         applicable_layer: LAYERS[index],
-        callout_id: G_CALLOUT_ID[index],
+        callout_id: G_CALLOUT_ID[index].load(Ordering::Acquire),
     };
-    let status = FwpmCalloutAdd0(G_ENGINE, &callout, null_mut(), null_mut());
+    let engine = G_NET.lock().engine;
+    let status = FwpmCalloutAdd0(engine, &callout, null_mut(), null_mut());
     if NT_SUCCESS!(status) {
-        G_CALLOUT_ADDED[index] = true;
+        G_NET.lock().callout_added[index] = true;
     }
     status
 }
@@ -744,10 +676,12 @@ unsafe fn add_filter(index: usize) -> NTSTATUS {
         effective_weight: FwpValue { type_: 0, data: 0 },
     };
     let mut id = 0u64;
-    let status = FwpmFilterAdd0(G_ENGINE, &filter, null_mut(), &mut id);
+    let engine = G_NET.lock().engine;
+    let status = FwpmFilterAdd0(engine, &filter, null_mut(), &mut id);
     if NT_SUCCESS!(status) {
-        G_FILTER_ADDED[index] = true;
-        G_FILTER_ID[index] = id;
+        let mut state = G_NET.lock();
+        state.filter_added[index] = true;
+        state.filter_id[index] = id;
     }
     status
 }
@@ -763,7 +697,12 @@ unsafe fn open_engine() -> NTSTATUS {
         username: null_mut(),
         kernel_mode: TRUE as i32,
     };
-    FwpmEngineOpen0(null(), RPC_C_AUTHN_WINNT, null_mut(), &session, addr_of_mut!(G_ENGINE))
+    let mut engine: HANDLE = null_mut();
+    let status = FwpmEngineOpen0(null(), RPC_C_AUTHN_WINNT, null_mut(), &session, &mut engine);
+    if NT_SUCCESS!(status) {
+        G_NET.lock().engine = engine;
+    }
+    status
 }
 
 unsafe fn add_sublayer() -> NTSTATUS {
@@ -775,80 +714,91 @@ unsafe fn add_sublayer() -> NTSTATUS {
         provider_data: FwpByteBlob { size: 0, data: null_mut() },
         weight: 0x0100,
     };
-    let status = FwpmSubLayerAdd0(G_ENGINE, &sublayer, null_mut());
+    let engine = G_NET.lock().engine;
+    let status = FwpmSubLayerAdd0(engine, &sublayer, null_mut());
     if NT_SUCCESS!(status) {
-        G_SUBLAYER_ADDED = true;
+        G_NET.lock().sublayer_added = true;
     }
     status
 }
 
 unsafe fn start_drain_thread() -> NTSTATUS {
-    PsCreateSystemThread(
-        &mut G_NET_THREAD,
+    let mut thread: HANDLE = null_mut();
+    let status = PsCreateSystemThread(
+        &mut thread,
         0x0010_0000, // SYNCHRONIZE
         null_mut(),
         null_mut(),
         null_mut(),
         drain_thread,
         null_mut(),
-    )
+    );
+    if NT_SUCCESS!(status) {
+        G_NET_THREAD.store(thread as usize, Ordering::Release);
+    }
+    status
 }
 
 /// Registers the callout, sublayer and filters and starts the drain thread. PASSIVE_LEVEL.
 /// # Safety
 /// `driver` is the DRIVER_OBJECT from DriverEntry.
 pub(crate) unsafe fn start(driver: *mut DRIVER_OBJECT) -> NTSTATUS {
-    G_RING_LOCK.init();
-    flow_pool_init();
+    G_RING.init();
+    G_NET.init();
     // before any filter is live: a classify that fires during registration must not touch an
     // uninitialized event (`KeSetEvent` would be lost by the later `KeInitializeEvent`)
-    KeInitializeEvent(&mut G_NET_WAKE, SynchronizationEvent, 0);
+    {
+        let mut ring = G_RING.lock();
+        KeInitializeEvent(&mut ring.wake, SynchronizationEvent, 0);
+    }
+    G_STARTED.store(1, Ordering::Release);
 
     let mut device: *mut DEVICE_OBJECT = null_mut();
     let status = IoCreateDevice(driver, 0, null(), FILE_DEVICE_UNKNOWN, 0, 0, &mut device);
     if !NT_SUCCESS!(status) {
         log::warn!("wfp: IoCreateDevice failed. Status: 0x{:08x}", status);
+        rollback();
         return status;
     }
     (*device).Flags &= !DO_DEVICE_INITIALIZING;
-    G_DEVICE = device;
+    G_NET.lock().device = device;
 
     let mut status = open_engine();
     if !NT_SUCCESS!(status) {
         log::warn!("wfp: FwpmEngineOpen0 failed. Status: 0x{:08x}", status);
-        stop();
+        rollback();
         return status;
     }
     status = add_sublayer();
     if !NT_SUCCESS!(status) {
         log::warn!("wfp: FwpmSubLayerAdd0 failed. Status: 0x{:08x}", status);
-        stop();
+        rollback();
         return status;
     }
     for index in 0..4 {
         status = register_callout(index);
         if !NT_SUCCESS!(status) {
             log::warn!("wfp: callout {} register failed. Status: 0x{:08x}", index, status);
-            stop();
+            rollback();
             return status;
         }
         status = add_callout(index);
         if !NT_SUCCESS!(status) {
             log::warn!("wfp: callout {} add failed. Status: 0x{:08x}", index, status);
-            stop();
+            rollback();
             return status;
         }
         status = add_filter(index);
         if !NT_SUCCESS!(status) {
             log::warn!("wfp: filter {} add failed. Status: 0x{:08x}", index, status);
-            stop();
+            rollback();
             return status;
         }
     }
     status = start_drain_thread();
     if !NT_SUCCESS!(status) {
         log::warn!("wfp: drain thread failed. Status: 0x{:08x}", status);
-        stop();
+        rollback();
         return status;
     }
     log::info!("wfp: callout registered on 4 ALE layers");
@@ -856,59 +806,203 @@ pub(crate) unsafe fn start(driver: *mut DRIVER_OBJECT) -> NTSTATUS {
 }
 
 unsafe fn stop_drain_thread() {
-    {
-        let _guard = G_RING_LOCK.lock();
-        G_NET_STOP = true;
-    }
-    if !G_NET_THREAD.is_null() {
-        KeSetEvent(&mut G_NET_WAKE, 0, 0);
-        ZwWaitForSingleObject(G_NET_THREAD, 0, null());
-        ZwClose(G_NET_THREAD);
-        G_NET_THREAD = null_mut();
+    G_RING.lock().stop = true;
+    let thread = G_NET_THREAD.swap(0, Ordering::AcqRel) as HANDLE;
+    if !thread.is_null() {
+        KeSetEvent(wake_ptr(), 0, 0);
+        ZwWaitForSingleObject(thread, 0, null());
+        ZwClose(thread);
     }
 }
 
-/// Removes the filters, callouts and sublayer and stops the drain thread. PASSIVE_LEVEL.
-pub(crate) unsafe fn stop() {
+const STATUS_DEVICE_BUSY: NTSTATUS = 0xC000_004Fu32 as NTSTATUS;
+const FWP_E_CALLOUT_NOT_FOUND: NTSTATUS = 0x8032_0001u32 as NTSTATUS;
+const FWP_E_FILTER_NOT_FOUND: NTSTATUS = 0x8032_0003u32 as NTSTATUS;
+const FWP_E_SUBLAYER_NOT_FOUND: NTSTATUS = 0x8032_0007u32 as NTSTATUS;
+const FWP_E_IN_USE: NTSTATUS = 0x8032_000Au32 as NTSTATUS;
+
+/// Runs one teardown call, retrying transient busy/in-use statuses at PASSIVE_LEVEL.
+/// Returns `STATUS_SUCCESS` on success or an already-deleted object (`not_found`).
+macro_rules! teardown {
+    ($step:expr, $not_found:expr, $alt_not_found:expr, $call:expr) => {{
+        let mut result = STATUS_SUCCESS;
+        for attempt in 0..10 {
+            let status = $call;
+            if NT_SUCCESS!(status) || status == $not_found || status == $alt_not_found {
+                break;
+            }
+            if status != STATUS_DEVICE_BUSY && status != FWP_E_IN_USE {
+                log::warn!("wfp: {} failed. Status: 0x{:08x}", $step, status);
+                result = status;
+                break;
+            }
+            if attempt == 9 {
+                log::warn!("wfp: {} still busy. Status: 0x{:08x}", $step, status);
+                result = status;
+                break;
+            }
+            let interval: i64 = -10 * 10_000;
+            KeDelayExecutionThread(0, 0, &interval);
+        }
+        result
+    }};
+}
+
+/// Cleans up a partially started WFP state; logs a failure instead of hiding it.
+unsafe fn rollback() {
+    let status = stop();
+    if !NT_SUCCESS!(status) {
+        log::warn!("wfp: rollback incomplete. Status: 0x{:08x}", status);
+    }
+}
+
+/// Stops the drain thread and releases the WFP objects. PASSIVE_LEVEL.
+///
+/// The WFP teardown calls require PASSIVE_LEVEL, and `Locked::lock` holds the FAST_MUTEX at
+/// APC_LEVEL: everything needed is copied under the lock, which is then dropped, and the calls run
+/// outside it. Holding the lock here made every call return STATUS_NOT_SUPPORTED and left the
+/// callout registration pinning the driver image until reboot.
+///
+/// Returns a failure if any object could not be released; the caller must then keep the image
+/// loaded (an unloaded image with a live callout/filter is the 0xCE class of bug).
+pub(crate) unsafe fn stop() -> NTSTATUS {
+    // start() never ran: nothing to tear down, and the locks were never initialized
+    if G_STARTED.load(Ordering::Acquire) == 0 {
+        return STATUS_SUCCESS;
+    }
     // stop the drain thread first: after this nothing calls send_message for a net event
     stop_drain_thread();
-    if !G_ENGINE.is_null() {
-        for index in 0..4 {
-            if G_FILTER_ADDED[index] {
-                FwpmFilterDeleteById0(G_ENGINE, G_FILTER_ID[index]);
-                G_FILTER_ADDED[index] = false;
+    let (
+        engine,
+        device,
+        filter_added,
+        filter_id,
+        callout_added,
+        callout_registered,
+        sublayer_added,
+    ) = {
+        let state = G_NET.lock();
+        (
+            state.engine,
+            state.device,
+            state.filter_added,
+            state.filter_id,
+            state.callout_added,
+            state.callout_registered,
+            state.sublayer_added,
+        )
+    };
+    let mut failure = STATUS_SUCCESS;
+    macro_rules! remember {
+        ($status:expr) => {{
+            let status = $status;
+            if !NT_SUCCESS!(status) && NT_SUCCESS!(failure) {
+                failure = status;
             }
-            if G_CALLOUT_ADDED[index] {
-                FwpmCalloutDeleteByKey0(G_ENGINE, &CALLBACK_KEYS[index]);
-                G_CALLOUT_ADDED[index] = false;
-            }
-        }
-        for index in 0..4 {
-            if G_CALLOUT_REGISTERED[index] {
-                FwpsCalloutUnregisterById0(G_CALLOUT_ID[index]);
-                G_CALLOUT_REGISTERED[index] = false;
-            }
-        }
-        if G_SUBLAYER_ADDED {
-            FwpmSubLayerDeleteByKey0(G_ENGINE, &SUBLAYER_KEY);
-            G_SUBLAYER_ADDED = false;
-        }
-        FwpmEngineClose0(G_ENGINE);
-        G_ENGINE = null_mut();
+        }};
     }
-    if !G_DEVICE.is_null() {
-        IoDeleteDevice(G_DEVICE);
-        G_DEVICE = null_mut();
+    if !engine.is_null() {
+        for index in 0..4 {
+            if filter_added[index] {
+                let status = teardown!(
+                    "FwpmFilterDeleteById0",
+                    FWP_E_FILTER_NOT_FOUND,
+                    STATUS_SUCCESS,
+                    FwpmFilterDeleteById0(engine, filter_id[index])
+                );
+                remember!(status);
+                if NT_SUCCESS!(status) {
+                    G_NET.lock().filter_added[index] = false;
+                }
+            }
+            if callout_added[index] {
+                let status = teardown!(
+                    "FwpmCalloutDeleteByKey0",
+                    FWP_E_CALLOUT_NOT_FOUND,
+                    STATUS_SUCCESS,
+                    FwpmCalloutDeleteByKey0(engine, &CALLBACK_KEYS[index])
+                );
+                remember!(status);
+                if NT_SUCCESS!(status) {
+                    G_NET.lock().callout_added[index] = false;
+                }
+            }
+        }
+        // no flow contexts are associated, so this cannot return STATUS_DEVICE_BUSY
+        for index in 0..4 {
+            if callout_registered[index] {
+                let id = G_CALLOUT_ID[index].load(Ordering::Acquire);
+                let status = teardown!(
+                    "FwpsCalloutUnregisterById0",
+                    FWP_E_CALLOUT_NOT_FOUND,
+                    STATUS_NOT_FOUND,
+                    FwpsCalloutUnregisterById0(id)
+                );
+                remember!(status);
+                if NT_SUCCESS!(status) {
+                    G_NET.lock().callout_registered[index] = false;
+                    G_CALLOUT_ID[index].store(0, Ordering::Release);
+                }
+            }
+        }
+        if sublayer_added {
+            let status = teardown!(
+                "FwpmSubLayerDeleteByKey0",
+                FWP_E_SUBLAYER_NOT_FOUND,
+                STATUS_SUCCESS,
+                FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_KEY)
+            );
+            remember!(status);
+            if NT_SUCCESS!(status) {
+                G_NET.lock().sublayer_added = false;
+            }
+        }
+        // closing the engine while an earlier delete failed would invalidate the handle a retry needs
+        if NT_SUCCESS!(failure) {
+            let status = teardown!(
+                "FwpmEngineClose0",
+                STATUS_SUCCESS,
+                STATUS_SUCCESS,
+                FwpmEngineClose0(engine)
+            );
+            remember!(status);
+            if NT_SUCCESS!(status) {
+                G_NET.lock().engine = null_mut();
+            }
+        }
     }
-    if G_NET_DROPPED != 0 {
-        log::warn!("wfp: net events dropped (ring full): {}", G_NET_DROPPED);
-        G_NET_DROPPED = 0;
+    if !NT_SUCCESS!(failure) {
+        // G_STARTED and the not-yet-cleared fields stay set so a retry can finish; do not delete the
+        // device or reset the ring while a callout/filter may still reference this image
+        log::error!("wfp: teardown incomplete 0x{:08x}; keeping the image loaded", failure);
+        return failure;
+    }
+    G_STARTED.store(0, Ordering::Release);
+    let mut state = G_NET.lock();
+    state.filter_id = [0; 4];
+    for id in G_CALLOUT_ID.iter() {
+        id.store(0, Ordering::Release);
+    }
+    drop(state);
+    if !device.is_null() {
+        IoDeleteDevice(device);
+        G_NET.lock().device = null_mut();
+    }
+    let dropped = {
+        let mut ring = G_RING.lock();
+        let dropped = ring.dropped;
+        ring.dropped = 0;
+        dropped
+    };
+    if dropped != 0 {
+        log::warn!("wfp: net events dropped (ring full): {}", dropped);
     }
     {
-        let _guard = G_RING_LOCK.lock();
-        G_RING_HEAD = 0;
-        G_RING_TAIL = 0;
-        G_RING_LEN = 0;
-        G_NET_STOP = false;
+        let mut ring = G_RING.lock();
+        ring.head = 0;
+        ring.tail = 0;
+        ring.len = 0;
+        ring.stop = false;
     }
+    STATUS_SUCCESS
 }

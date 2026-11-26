@@ -22,16 +22,6 @@ if (-not (bcdedit /enum '{current}' | Select-String -Pattern 'testsigning\s+Yes'
     throw "test signing is off: run 'bcdedit /set testsigning on', reboot, then retry"
 }
 
-# WFP callouts cannot be re-registered safely in the same boot yet: refuse a second load
-$marker = Join-Path $env:ProgramData 'ramon\last-load.txt'
-$boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('o')
-if (Test-Path -LiteralPath $marker) {
-    $last = (Get-Content -LiteralPath $marker -Raw).Trim()
-    if ($last -eq $boot) {
-        throw "ramon was already loaded once in this boot. The WFP callout cannot be registered a second time safely yet - reboot and retry."
-    }
-}
-
 $destination = Join-Path $env:SystemRoot 'System32\drivers\ramon.sys'
 try {
     Copy-Item -LiteralPath $DriverPath -Destination $destination -Force
@@ -60,6 +50,4 @@ fltmc load $ServiceName
 if ($LASTEXITCODE -ne 0) {
     throw "fltmc load $ServiceName failed: $LASTEXITCODE"
 }
-New-Item -ItemType Directory -Force (Split-Path -Parent $marker) | Out-Null
-Set-Content -LiteralPath $marker -Value $boot
 Write-Host "loaded: $ServiceName"

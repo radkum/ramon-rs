@@ -7,7 +7,8 @@
 #![feature(allocator_api)]
 #![feature(vec_push_within_capacity)]
 #![allow(non_snake_case)]
-#![allow(static_mut_refs)]
+// the driver keeps its state in Locked/SpinLocked; do not let a new `static mut` slip in
+#![deny(static_mut_refs)]
 
 mod cleaner;
 
@@ -15,6 +16,7 @@ mod guardrail;
 mod ioctl_code;
 mod irp;
 mod libm_shim;
+mod locked;
 mod logger;
 mod minifilter;
 mod mirage;
@@ -35,7 +37,6 @@ extern crate alloc;
 
 use core::ptr::null_mut;
 
-use kernel_fast_mutex::{fast_mutex::FastMutex, locker::Locker};
 /// kernel-init deliver a few elements (eg. panic implementation) necessary to run code in kernel
 #[allow(unused_imports)]
 use kernel_init;
@@ -46,7 +47,7 @@ use km_api_sys::{
         PsRemoveLoadImageNotifyRoutine, PsSetCreateProcessNotifyRoutineEx,
         PsSetLoadImageNotifyRoutine,
     },
-    wmd::{CmRegisterCallbackEx, CmUnRegisterCallback, LARGE_INTEGER},
+    wmd::{CmUnRegisterCallback, LARGE_INTEGER},
 };
 use log::LevelFilter;
 use winapi::{
@@ -58,15 +59,46 @@ use winapi::{
 };
 
 use crate::{
-    cleaner::Cleaner, irp::complete_irp_success, logger::KernelLogger, minifilter::Minifilter,
+    cleaner::Cleaner, irp::complete_irp_success, locked::Locked, logger::KernelLogger,
+    minifilter::Minifilter,
 };
 
 #[allow(dead_code)]
 pub(crate) const POOL_TAG: u32 = u32::from_ne_bytes(*b"RDER");
 
-static mut G_MUTEX: FastMutex = FastMutex::new();
-//static mut G_PROCESS_NAMES: Option<BTreeSet<ULONG>> = None;
-static mut G_COOKIE: LARGE_INTEGER = LARGE_INTEGER::new();
+// km-api-sys declares the cookie as `&LARGE_INTEGER`. That is an out-parameter, and a shared
+// reference lets the optimizer assume the callee does not write to it: the cookie was stored as
+// zero and CmUnRegisterCallback(0) silently failed, leaving the registry callback registered after
+// the driver image unloaded (bugcheck 0xCE). Declare the real ABI here so the write is visible.
+extern "system" {
+    fn CmRegisterCallbackEx(
+        Function: PVOID,
+        Altitude: &UNICODE_STRING,
+        Driver: &DRIVER_OBJECT,
+        Context: PVOID,
+        Cookie: *mut LARGE_INTEGER,
+        Reserved: PVOID,
+    ) -> NTSTATUS;
+}
+
+// the registry callback cookie: written at load, read by the registry callback and on unload
+pub(crate) static G_COOKIE: Locked<LARGE_INTEGER> = Locked::new(LARGE_INTEGER::new());
+
+// Unregistering is not idempotent: a retried unload must resume after the last callback that was
+// actually removed, not fail on the already-removed one.
+struct NotifyState {
+    process_removed: bool,
+    image_removed: bool,
+    registry_removed: bool,
+    object_removed: bool,
+}
+
+static G_NOTIFY: Locked<NotifyState> = Locked::new(NotifyState {
+    process_removed: false,
+    image_removed: false,
+    registry_removed: false,
+    object_removed: false,
+});
 
 #[link_section = "INIT"]
 #[no_mangle]
@@ -77,12 +109,14 @@ pub unsafe extern "system" fn DriverEntry(
     KernelLogger::init(LevelFilter::Warn).expect("Failed to initialize logger");
 
     log::info!("START Ramon");
+    G_COOKIE.init();
+    G_NOTIFY.init();
+    // before start_sender: the sender's deliver() locks the minifilter slot
+    minifilter::init();
 
     let hello_world = unicode_string("Hello World!");
     log::info!("{}", hello_world);
 
-    //--------------------GLOBALS--------------------------------
-    G_MUTEX.Init();
     init_tree();
     guardrail::init();
     mirage::init();
@@ -128,17 +162,22 @@ pub unsafe extern "system" fn DriverEntry(
 
         //--------------------REGISTRY NOTIFY-----------------------
         let altitude = unicode_string("7657.124");
+        let mut cookie = LARGE_INTEGER::new();
         status = CmRegisterCallbackEx(
             OnRegistryNotify as PVOID,
             &altitude,
             driver,
             null_mut(),
-            &G_COOKIE,
+            &mut cookie,
             null_mut(),
         );
 
         if NT_SUCCESS!(status) {
-            cleaner.init_registry_callback(G_COOKIE);
+            // tiny window: a registry callback on another CPU can fire before this assignment and
+            // see cookie = 0, in which case it skips the event (CmCallbackGetKeyObjectIDEx fails).
+            // Benign - no crash, at most one missed registry event in the load window.
+            *G_COOKIE.lock() = cookie;
+            cleaner.init_registry_callback(cookie);
         } else {
             log::info!("failed to create registry routine 0x{:08x}", status);
             break;
@@ -190,19 +229,58 @@ pub(crate) fn unicode_string(s: &str) -> UNICODE_STRING {
 /*************************************************************************
                     Dispatch  routines.
 *************************************************************************/
-pub(crate) unsafe fn unregister_notify_callbacks() {
+/// Returns the first failure: a callback that could not be removed would outlive the image, so the
+/// caller must keep the driver loaded instead of letting FltMgr detach it. Each successful removal
+/// is remembered, so a retry resumes instead of failing on an already-removed routine.
+pub(crate) unsafe fn unregister_notify_callbacks() -> NTSTATUS {
     log::info!("rust_unload");
 
-    PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, TRUE);
-    clear_tree();
+    let (process_removed, image_removed, registry_removed, object_removed) = {
+        let state = G_NOTIFY.lock();
+        (state.process_removed, state.image_removed, state.registry_removed, state.object_removed)
+    };
+
+    if !process_removed {
+        let status = PsSetCreateProcessNotifyRoutineEx(OnProcessNotify, TRUE);
+        if !NT_SUCCESS!(status) {
+            log::warn!(
+                "PsSetCreateProcessNotifyRoutineEx(remove) failed. Status: 0x{:08x}",
+                status
+            );
+            return status;
+        }
+        G_NOTIFY.lock().process_removed = true;
+        clear_tree();
+    }
 
     //PsRemoveCreateThreadNotifyRoutine(OnThreadNotify);
 
-    PsRemoveLoadImageNotifyRoutine(OnImageLoadNotify);
+    if !image_removed {
+        let status = PsRemoveLoadImageNotifyRoutine(OnImageLoadNotify);
+        if !NT_SUCCESS!(status) {
+            log::warn!("PsRemoveLoadImageNotifyRoutine failed. Status: 0x{:08x}", status);
+            return status;
+        }
+        G_NOTIFY.lock().image_removed = true;
+    }
 
-    CmUnRegisterCallback(G_COOKIE);
+    if !registry_removed {
+        // copy the cookie and release the lock first: CmUnRegisterCallback waits for in-flight
+        // registry callbacks, and one of them may be waiting for this lock
+        let cookie = *G_COOKIE.lock();
+        let status = CmUnRegisterCallback(cookie);
+        if !NT_SUCCESS!(status) {
+            log::warn!("CmUnRegisterCallback failed. Status: 0x{:08x}", status);
+            return status;
+        }
+        G_NOTIFY.lock().registry_removed = true;
+    }
 
-    stop_object_notify();
+    if !object_removed {
+        stop_object_notify();
+        G_NOTIFY.lock().object_removed = true;
+    }
+    STATUS_SUCCESS
 }
 
 extern "system" fn DispatchCreateClose(_driver: &mut DEVICE_OBJECT, irp: &mut IRP) -> NTSTATUS {

@@ -4,8 +4,6 @@
 //! IRQL: post-create and set-information run at PASSIVE_LEVEL; the write and section post-ops
 //! can run at DISPATCH_LEVEL (paging I/O) - those paths only touch atomics and hand the report
 //! to a PASSIVE_LEVEL drain (`section_sync::drain_written`).
-#![allow(static_mut_refs)]
-
 use alloc::string::String;
 use core::{mem::ManuallyDrop, ptr::null_mut};
 
@@ -30,7 +28,7 @@ use km_api_sys::{
         FltGetFileNameInformation, FltGetVolumeFromFileObject, FltGetVolumeGuidName,
         FltIsDirectory, FltParseFileNameInformation, FltReleaseFileNameInformation,
         FILE_INFORMATION_CLASS, FLT_CALLBACK_DATA, FLT_FILE_NAME_OPTIONS,
-        FLT_POSTOP_CALLBACK_STATUS,
+        FLT_PARAMETERS_SET_FILE_INFORMATION, FLT_POSTOP_CALLBACK_STATUS,
         FLT_POSTOP_CALLBACK_STATUS::FLT_POSTOP_FINISHED_PROCESSING,
         FLT_POST_OPERATION_FLAGS, FLT_PREOP_CALLBACK_STATUS,
         FLT_PREOP_CALLBACK_STATUS::{
@@ -47,7 +45,7 @@ use winapi::{
         KPROCESSOR_MODE,
     },
     shared::{
-        ntdef::{BOOLEAN, NTSTATUS, PVOID, TRUE, ULONG},
+        ntdef::{BOOLEAN, HANDLE, NTSTATUS, PVOID, TRUE, ULONG},
         ntstatus::{STATUS_ACCESS_DENIED, STATUS_REPARSE},
     },
 };
@@ -63,10 +61,36 @@ extern "system" {
         name_options: FLT_FILE_NAME_OPTIONS,
         file_name_information: *mut PFLT_FILE_NAME_INFORMATION,
     ) -> NTSTATUS;
+    fn FltGetDestinationFileNameInformation(
+        instance: PFLT_INSTANCE,
+        file_object: PVOID,
+        root_directory: HANDLE,
+        file_name: *mut u16,
+        file_name_length: u32,
+        name_options: FLT_FILE_NAME_OPTIONS,
+        file_name_information: *mut PFLT_FILE_NAME_INFORMATION,
+    ) -> NTSTATUS;
 }
+
+// FILE_RENAME_INFORMATION / FILE_LINK_INFORMATION and their Ex variants share the same layout from
+// `RootDirectory` on; only the target name is read, so the leading BOOLEAN/ULONG is skipped.
+#[repr(C)]
+struct RenameInfoBuffer {
+    _flags_or_replace: u64,
+    root_directory: HANDLE,
+    file_name_length: u32,
+    file_name: [u16; 1],
+}
+const RENAME_NAME_OFFSET: usize = 20;
 const FLTFL_POST_OPERATION_DRAINING: FLT_POST_OPERATION_FLAGS = 0x1;
-// None reports every successful open (what MOTA needs), at many times the event volume
-const REPORTED_EXTENSION: Option<&str> = Some("exe");
+// FileCreateEvent: `.exe` on any open (execution or drop) as before; other payload types only on
+// a create with write/delete intent, so image loads and ordinary reads do not flood the log.
+const REPORTED_ALWAYS: &[&str] = &["exe"];
+const REPORTED_ON_WRITE: &[&str] = &[
+    "dll", "sys", "ps1", "psm1", "psd1", "bat", "cmd", "vbs", "vbe", "js", "jse", "wsf", "wsh",
+    "hta", "py", "rb", "pl", "php", "reg", "lnk", "url", "scr", "com", "msi", "jar", "zip", "7z",
+    "rar", "iso", "img", "docm", "xlsm", "pptm", "chm", "cpl", "ocx", "pif",
+];
 // FileTelemetry is for content worth grepping; image loads often request write-like access.
 const TELEMETRY_EXTENSIONS: &[&str] = &[
     "txt",
@@ -144,9 +168,9 @@ impl FileMonitor {
         flt_objects: &mut FLT_RELATED_OBJECTS,
         _completion_context: *mut PVOID,
     ) -> FLT_PREOP_CALLBACK_STATUS {
-        // a kernel create (paging I/O, our own I/O) is never the agent's
+        // a kernel create (paging I/O, our own I/O) is never the agent's: no post-op needed
         if let KPROCESSOR_MODE::KernelMode = data.RequestorMode {
-            return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
         }
         let delete = delete_on_close(data);
         let access = desired_access(data);
@@ -220,6 +244,10 @@ impl FileMonitor {
         {
             return FLT_POSTOP_FINISHED_PROCESSING;
         }
+        // kernel creates no longer request a post-op, but be defensive if one arrives
+        if let KPROCESSOR_MODE::KernelMode = data.RequestorMode {
+            return FLT_POSTOP_FINISHED_PROCESSING;
+        }
 
         // skip if dir is created
         let mut is_dir: BOOLEAN = 0;
@@ -289,11 +317,8 @@ impl FileMonitor {
             }
         }
 
-        let reported = match REPORTED_EXTENSION {
-            None => true,
-            Some(reported) => extension.is_some_and(|e| e.eq_ignore_ascii_case(reported)),
-        };
-        if reported {
+        let write_intent = telemetry_intent(data) == Some(INTENT_WRITE) || delete_on_close(data);
+        if reported_extension(extension.as_deref(), write_intent) {
             FileMonitor::ProcessFileEvent(file_name);
         }
 
@@ -354,11 +379,25 @@ impl FileMonitor {
             return FLT_PREOP_SUCCESS_NO_CALLBACK;
         }
         let info = unsafe { &(*data.Iopb).Parameters.SetFileInformation };
-        let kind = match &info.FileInformationClass {
+        // `kind` is the telemetry kind (delete/rename); `target` says the operation names a
+        // destination (rename/hardlink) that must be checked for a protected path too
+        let (kind, target, telemetry) = match &info.FileInformationClass {
             FILE_INFORMATION_CLASS::FileDispositionInformation
-            | FILE_INFORMATION_CLASS::FileDispositionInformationEx => KIND_DELETE,
+            | FILE_INFORMATION_CLASS::FileDispositionInformationEx => (KIND_DELETE, false, true),
             FILE_INFORMATION_CLASS::FileRenameInformation
-            | FILE_INFORMATION_CLASS::FileRenameInformationEx => KIND_RENAME,
+            | FILE_INFORMATION_CLASS::FileRenameInformationEx
+            | FILE_INFORMATION_CLASS::FileRenameInformationBypassAccessCheck
+            | FILE_INFORMATION_CLASS::FileRenameInformationExBypassAccessCheck => {
+                (KIND_RENAME, true, true)
+            },
+            FILE_INFORMATION_CLASS::FileLinkInformation
+            | FILE_INFORMATION_CLASS::FileLinkInformationEx
+            | FILE_INFORMATION_CLASS::FileLinkInformationBypassAccessCheck
+            | FILE_INFORMATION_CLASS::FileLinkInformationExBypassAccessCheck => {
+                (KIND_RENAME, true, false)
+            },
+            // an 8.3 alias change must not rename a protected file's short name
+            FILE_INFORMATION_CLASS::FileShortNameInformation => (KIND_RENAME, false, false),
             _ => return FLT_PREOP_SUCCESS_NO_CALLBACK,
         };
         // a delete drops the MOTA marker for this FileId, whatever the process (a FileId NTFS later
@@ -375,23 +414,52 @@ impl FileMonitor {
         let Some((file_name, _device, _)) = file_path(data, flt_objects) else {
             return FLT_PREOP_SUCCESS_NO_CALLBACK;
         };
-        let protected = match session {
-            Some(_) => unsafe { guardrail::is_protected_tagged(&file_name) },
-            None => unsafe { guardrail::is_protected_any(&file_name) },
+        let protected = |name: &str| match session {
+            Some(_) => unsafe { guardrail::is_protected_tagged(name) },
+            None => unsafe { guardrail::is_protected_any(name) },
         };
-        if protected {
+        // the source path covers a delete, a rename out of a protected path, and the hardlink
+        // bypass (linking the protected file itself to an unprotected name)
+        let mut blocked = protected(&file_name);
+        let mut blocked_target: Option<String> = None;
+        if !blocked && target {
+            // the destination path covers renaming/overwriting a protected name and linking to one
+            match destination_name(flt_objects, info) {
+                Some(name) => {
+                    if protected(&name) {
+                        blocked = true;
+                        blocked_target = Some(name);
+                    }
+                },
+                None => {
+                    let protected_target = match target_name_utf16(info) {
+                        Some(name) => match session {
+                            Some(_) => unsafe { guardrail::is_protected_tagged_utf16(name) },
+                            None => unsafe { guardrail::is_protected_any_utf16(name) },
+                        },
+                        None => false,
+                    };
+                    blocked = protected_target;
+                },
+            }
+        }
+        if blocked {
             // the any-process tier never refuses SYSTEM or an administrator
             if session.is_none() && unsafe { guardrail::is_privileged() } {
                 return FLT_PREOP_SUCCESS_NO_CALLBACK;
             }
             let guardrail_kind = if kind == KIND_DELETE { GRB_DELETE } else { GRB_RENAME };
-            block_guardrail(data, pid, session, guardrail_kind, &file_name);
+            // report the path that actually tripped the rule (target for rename-over/link)
+            let name = blocked_target.as_deref().unwrap_or(&file_name);
+            block_guardrail(data, pid, session, guardrail_kind, name);
             return FLT_PREOP_COMPLETE;
         }
         // the telemetry record is for the agent tree only
-        if let Some(session) = session {
-            if let Ok(name) = try_to_string(&file_name) {
-                FileMonitor::ProcessFileSetInformationEvent(pid, session, kind, name);
+        if telemetry {
+            if let Some(session) = session {
+                if let Ok(name) = try_to_string(&file_name) {
+                    FileMonitor::ProcessFileSetInformationEvent(pid, session, kind, name);
+                }
             }
         }
         FLT_PREOP_SUCCESS_NO_CALLBACK
@@ -506,6 +574,14 @@ fn telemetry_extension(extension: Option<&str>) -> bool {
     })
 }
 
+fn reported_extension(extension: Option<&str>, write: bool) -> bool {
+    let Some(extension) = extension else {
+        return false;
+    };
+    REPORTED_ALWAYS.iter().any(|wanted| extension.eq_ignore_ascii_case(wanted))
+        || (write && REPORTED_ON_WRITE.iter().any(|wanted| extension.eq_ignore_ascii_case(wanted)))
+}
+
 fn canary_extension(extension: Option<&str>) -> bool {
     extension.is_some_and(|extension| extension.eq_ignore_ascii_case(CANARY_EXTENSION))
 }
@@ -566,6 +642,52 @@ fn file_path_unsafe(
         return None;
     }
     let result = parse_name_info(pfile_name_info, flt_objects);
+    unsafe { FltReleaseFileNameInformation(pfile_name_info) };
+    result
+}
+
+// rename/link destination: the raw UTF-16 name for the fallback guardrail match
+fn target_name_utf16(info: &FLT_PARAMETERS_SET_FILE_INFORMATION) -> Option<&[u16]> {
+    if info.InfoBuffer.is_null() || (info.Length as usize) < RENAME_NAME_OFFSET {
+        return None;
+    }
+    let buffer = info.InfoBuffer as *const RenameInfoBuffer;
+    let length = unsafe { (*buffer).file_name_length } as usize;
+    if length == 0 || length % 2 != 0 || length > (info.Length as usize) - RENAME_NAME_OFFSET {
+        return None;
+    }
+    Some(unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!((*buffer).file_name) as *const u16,
+            length / 2,
+        )
+    })
+}
+
+// ask FltMgr for the fully resolved destination (handles RootDirectory and relative names)
+fn destination_name(
+    flt_objects: &mut FLT_RELATED_OBJECTS,
+    info: &FLT_PARAMETERS_SET_FILE_INFORMATION,
+) -> Option<String> {
+    let file_name = target_name_utf16(info)?;
+    let root_directory = unsafe { (*(info.InfoBuffer as *const RenameInfoBuffer)).root_directory };
+    let flags = FLT_FILE_NAME_OPTIONS(FLT_FILE_NAME_OPTIONS::FLT_FILE_NAME_NORMALIZED);
+    let mut pfile_name_info = null_mut();
+    let status = unsafe {
+        FltGetDestinationFileNameInformation(
+            flt_objects.Instance,
+            flt_objects.FileObject as PVOID,
+            root_directory,
+            file_name.as_ptr() as *mut u16,
+            (file_name.len() * 2) as u32,
+            flags,
+            &mut pfile_name_info,
+        )
+    };
+    if !NT_SUCCESS!(status) || pfile_name_info.is_null() {
+        return None;
+    }
+    let result = unsafe { (*pfile_name_info).Name.as_rust_string() };
     unsafe { FltReleaseFileNameInformation(pfile_name_info) };
     result
 }

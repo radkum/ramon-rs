@@ -3,75 +3,111 @@
 //! IRQL: `RamonUnload` and the port callbacks run at PASSIVE_LEVEL; the file callbacks it
 //! dispatches are described in `minifilter/file_monitor.rs`. `RamonUnload` unregisters the
 //! notify callbacks and stops the sender thread before the filter and its state are freed.
-#![allow(static_mut_refs)]
-
 use alloc::boxed::Box;
-use core::{mem, mem::size_of, ptr::null_mut};
+use core::{
+    mem,
+    mem::size_of,
+    ptr::null_mut,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 mod file_monitor;
 use common::{
     command,
     constants::{COMM_PORT_NAME, FLT_PORT_ALL_ACCESS},
+    handshake,
 };
 use file_monitor::FileMonitor;
-use kernel_fast_mutex::auto_lock::AutoLock;
 use kernel_macros::{HandleToU32, NT_SUCCESS, PAGED_CODE};
-use km_api_sys::{flt_kernel::*, ntddk::PsGetCurrentProcessId};
+use km_api_sys::{flt_kernel::*, ntddk::PsGetCurrentProcessId, ntifs::PsGetCurrentProcess};
 use winapi::{
-    km::wdm::{DEVICE_TYPE, PDRIVER_OBJECT},
+    km::wdm::{DEVICE_TYPE, PDRIVER_OBJECT, PEPROCESS},
     shared::{
         ntdef::{
             InitializeObjectAttributes, NTSTATUS, OBJECT_ATTRIBUTES, OBJ_CASE_INSENSITIVE,
             OBJ_KERNEL_HANDLE, POBJECT_ATTRIBUTES, PUCHAR, PULONG, PVOID, ULONG, USHORT,
         },
         ntstatus::{
-            STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_NOT_FOUND,
-            STATUS_SUCCESS,
+            STATUS_ACCESS_DENIED, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER,
+            STATUS_NOT_FOUND, STATUS_SUCCESS,
         },
     },
     um::winnt::PSECURITY_DESCRIPTOR,
 };
 
+// FltCloseClientPort's real ABI takes a pointer to the handle and writes NULL through it. The
+// km-api-sys binding declares it as `&PFLT_PORT` (a shared reference to an out-parameter), the same
+// class of bug that broke the registry cookie; declare it correctly here.
+extern "system" {
+    fn FltCloseClientPort(Filter: PFLT_FILTER, ClientPort: *mut PFLT_PORT);
+    fn PsGetProcessImageFileName(process: PEPROCESS) -> *const u8;
+}
+
+// EPROCESS.ImageFileName is 15 bytes and not NUL-terminated when full.
+const IMAGE_FILE_NAME_LEN: usize = 15;
+// "ramon-client.exe" is 16 bytes, so the 15-byte image name is "ramon-client.ex".
+const CLIENT_IMAGE_PREFIX: &[u8] = b"ramon-client";
+// fltKernel.h; a mandatory unload proceeds even if the callback returns an error
+const FLTFL_FILTER_UNLOAD_MANDATORY: u32 = 0x0000_0001;
+
 use crate::{
+    locked::Locked,
     notifiers::{adopt, adopt_tag, MmCopyMemory, MM_COPY_MEMORY_VIRTUAL},
-    unicode_string, G_MUTEX,
+    unicode_string,
 };
 
 pub(crate) type PMINIFILTER = *mut Minifilter;
-pub(crate) static mut S_MINIFILTER: Option<Box<Minifilter>> = None;
-static mut INSTANCE_NUMBER: usize = 0;
+pub(crate) static S_MINIFILTER: Locked<Option<Box<Minifilter>>> = Locked::new(None);
+static INSTANCE_NUMBER: AtomicUsize = AtomicUsize::new(0);
+// the nonce of the last accepted handshake, so a captured connect context cannot be replayed
+static LAST_NONCE: Locked<[u8; handshake::NONCE_LEN]> = Locked::new([0u8; handshake::NONCE_LEN]);
+
+/// Initializes the slot before the sender thread exists: `deliver` may run while the notify
+/// callbacks registered in `DriverEntry` are already producing events, and a zeroed FAST_MUTEX
+/// is "locked" (bugcheck 0xA on the first acquire).
+pub(crate) unsafe fn init() {
+    S_MINIFILTER.init();
+    LAST_NONCE.init();
+}
 
 pub(crate) struct Minifilter {
     pub filter_handle: PFLT_FILTER,
     server_port: PFLT_PORT,
-    pub client_port: PFLT_PORT,
+    // set by on_connect, cleared by on_disconnect; atomic so `deliver` never reads a torn handle
+    client_port: AtomicUsize,
     //on_command: FN,
     //context: PVOID
 }
 
 impl Minifilter {
     fn new_empty() -> Minifilter {
-        Self { filter_handle: null_mut(), server_port: null_mut(), client_port: null_mut() }
+        Self {
+            filter_handle: null_mut(),
+            server_port: null_mut(),
+            client_port: AtomicUsize::new(0),
+        }
     }
 
     pub(crate) fn create(driver: PDRIVER_OBJECT) -> NTSTATUS {
-        let mut status = STATUS_SUCCESS;
         unsafe {
             log::info!("Minifilter::factory");
-            S_MINIFILTER = match Box::try_new(Minifilter::new_empty()) {
-                Ok(minifilter) => Some(minifilter),
+            let mut minifilter = match Box::try_new(Minifilter::new_empty()) {
+                Ok(minifilter) => minifilter,
                 Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
             };
-            if let Some(minifilter) = &mut S_MINIFILTER {
-                status = minifilter.init(driver)
-            }
-
-            if !NT_SUCCESS!(status) {
+            // do not publish the box until init succeeds: the sender can be in `deliver`, and this
+            // path frees the box after a failed init. The heap address stays stable when the Box is
+            // moved into the slot, so the communication-port cookie set by init stays valid.
+            let status = minifilter.init(driver);
+            if NT_SUCCESS!(status) {
+                *S_MINIFILTER.lock() = Some(minifilter);
+            } else {
                 log::info!("failed to init minifilter. Status: 0x{:08x}", status);
-                S_MINIFILTER = None;
+                // drop outside the lock: Minifilter::drop calls FltUnregisterFilter
+                drop(minifilter);
             }
+            status
         }
-        status
     }
 
     pub(crate) unsafe fn init(&mut self, driver: PDRIVER_OBJECT) -> NTSTATUS {
@@ -103,16 +139,18 @@ impl Minifilter {
     }
 
     //comm functions
-    pub(crate) fn is_comm_active(&self) -> bool {
-        !self.server_port.is_null() && !self.client_port.is_null()
+    /// Snapshot of the connected client port; `deliver` must not keep reading a field that
+    /// `on_disconnect` may clear and close concurrently.
+    pub(crate) fn client_port(&self) -> PFLT_PORT {
+        self.client_port.load(Ordering::Acquire) as PFLT_PORT
     }
 
     //comm callbacks
     pub(crate) unsafe extern "system" fn on_connect(
         client_port: PFLT_PORT,
         server_port_cookie: PVOID,
-        _connection_context: PVOID,
-        _size_of_context: ULONG,
+        connection_context: PVOID,
+        size_of_context: ULONG,
         connection_port_cookie: PPVOID,
     ) -> NTSTATUS {
         log::info!("Client Port connected");
@@ -121,10 +159,76 @@ impl Minifilter {
             return STATUS_INVALID_PARAMETER;
         }
 
-        let minifilter = server_port_cookie as PMINIFILTER;
-        (*minifilter).client_port = client_port;
+        // on_connect runs in the connecting client's context. Only the elevated sensor client may
+        // drive the port; the default port ACL alone is not an application-level check.
+        let process = PsGetCurrentProcess();
+        let image = PsGetProcessImageFileName(process);
+        let is_client = !image.is_null()
+            && core::slice::from_raw_parts(image, IMAGE_FILE_NAME_LEN)
+                .starts_with(CLIENT_IMAGE_PREFIX);
+        let privileged = crate::guardrail::is_privileged();
+        if !is_client || !privileged {
+            let name = if image.is_null() {
+                "<null>"
+            } else {
+                core::str::from_utf8(core::slice::from_raw_parts(image, IMAGE_FILE_NAME_LEN))
+                    .unwrap_or("<non-ascii>")
+            };
+            log::warn!(
+                "client port: rejected pid {} image {:?} privileged {}",
+                HandleToU32!(PsGetCurrentProcessId()),
+                name,
+                privileged
+            );
+            return STATUS_ACCESS_DENIED;
+        }
 
-        // on_connect runs in the connecting client's context: remember its pid so MOTA ignores it
+        // Cryptographic boundary: the connect context carries nonce || HMAC-SHA256(key, nonce).
+        // The name/privilege checks above are spoofable; this one requires the shared key.
+        let mut proof = [0u8; handshake::PROOF_LEN];
+        let mut copied = 0usize;
+        if size_of_context as usize != handshake::PROOF_LEN
+            || connection_context.is_null()
+            || !NT_SUCCESS!(MmCopyMemory(
+                proof.as_mut_ptr() as PVOID,
+                connection_context,
+                handshake::PROOF_LEN,
+                MM_COPY_MEMORY_VIRTUAL,
+                &mut copied,
+            ))
+            || copied != handshake::PROOF_LEN
+            || !handshake::verify_proof(handshake::port_key(), &proof)
+        {
+            log::warn!(
+                "client port: rejected pid {} (bad handshake proof)",
+                HandleToU32!(PsGetCurrentProcessId())
+            );
+            return STATUS_ACCESS_DENIED;
+        }
+
+        // a proof accepted once must not be accepted again: reject a replayed connect context
+        {
+            let nonce = handshake::proof_nonce(&proof);
+            let mut last = LAST_NONCE.lock();
+            if *last == *nonce {
+                log::warn!("client port: replayed handshake nonce");
+                return STATUS_ACCESS_DENIED;
+            }
+            last.copy_from_slice(nonce);
+        }
+
+        let minifilter = server_port_cookie as PMINIFILTER;
+        // check-and-store as one atomic: two concurrent connects must not both win
+        if (*minifilter)
+            .client_port
+            .compare_exchange(0, client_port as usize, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            log::warn!("client port: a client is already connected");
+            return STATUS_ACCESS_DENIED;
+        }
+
+        // remember the client pid so MOTA ignores its own opens
         crate::mota::set_client_pid(HandleToU32!(PsGetCurrentProcessId()));
 
         *connection_port_cookie = server_port_cookie;
@@ -140,8 +244,12 @@ impl Minifilter {
 
         let l_this = connection_cookie as PMINIFILTER;
 
-        FltCloseClientPort((*l_this).filter_handle, &mut (*l_this).client_port);
-        (*l_this).client_port = null_mut();
+        // the old client pid must not stay exempt from MOTA after the client is gone
+        crate::mota::set_client_pid(0);
+        let mut port = (*l_this).client_port.swap(0, Ordering::AcqRel) as PFLT_PORT;
+        if !port.is_null() {
+            FltCloseClientPort((*l_this).filter_handle, &mut port as *mut PFLT_PORT);
+        }
     }
 
     pub(crate) unsafe extern "system" fn on_command(
@@ -375,19 +483,35 @@ const FILTER_REGISTRATION: FLT_REGISTRATION = FLT_REGISTRATION {
     SectionNotificationCallback: null_mut(),
 };
 
-extern "system" fn RamonUnload(_flags: FLT_REGISTRATION_FLAGS) -> NTSTATUS {
+extern "system" fn RamonUnload(flags: FLT_REGISTRATION_FLAGS) -> NTSTATUS {
     log::info!("ramon_unload");
+    // A mandatory unload (forced/sc shutdown) proceeds even if this callback fails, so refusing is
+    // only meaningful for a normal unload. For mandatory, attempt everything best-effort: an early
+    // return would leave callbacks pointing into an image that is about to be freed.
+    let mandatory = flags & FLTFL_FILTER_UNLOAD_MANDATORY != 0;
     unsafe {
         // unregister the WFP callout first: after this no classify can read the tree or enqueue
-        crate::net::stop();
+        let status = crate::net::stop();
+        if !NT_SUCCESS!(status) {
+            if !mandatory {
+                // a callout/filter may still point into this image; let FltMgr keep it loaded
+                log::error!("wfp teardown failed 0x{:08x}; refusing to unload", status);
+                return status;
+            }
+            log::error!("wfp teardown failed 0x{:08x}; mandatory unload, continuing", status);
+        }
         // removal waits for in-flight notify callbacks, so none can call send_message after this
-        crate::unregister_notify_callbacks();
+        let status = crate::unregister_notify_callbacks();
+        if !NT_SUCCESS!(status) {
+            if !mandatory {
+                log::error!("notify teardown failed 0x{:08x}; refusing to unload", status);
+                return status;
+            }
+            log::error!("notify teardown failed 0x{:08x}; mandatory unload, continuing", status);
+        }
         crate::send_message::stop_sender();
-        // take under the lock send_message holds; drop outside it (FltUnregisterFilter must not run at APC_LEVEL)
-        let minifilter = {
-            let _locker = AutoLock::new(&mut G_MUTEX);
-            S_MINIFILTER.take()
-        };
+        // take under the lock, drop outside it (FltUnregisterFilter must not run at APC_LEVEL)
+        let minifilter = S_MINIFILTER.lock().take();
         // FltUnregisterFilter has returned, so no section callback can run: free the remembered paths
         drop(minifilter);
         crate::section_sync::clear();
@@ -415,9 +539,7 @@ extern "system" fn RamonInstanceSetup(
     _volume_filesystem_type: FLT_FILESYSTEM_TYPE,
 ) -> NTSTATUS {
     log::info!("RamonInstanceSetup");
-    unsafe {
-        INSTANCE_NUMBER += 1;
-    }
+    INSTANCE_NUMBER.fetch_add(1, Ordering::Relaxed);
     PAGED_CODE!();
     STATUS_SUCCESS
 }
@@ -442,9 +564,10 @@ extern "system" fn RamonInstanceTeardownStart(
     _flt_objects: PFLT_RELATED_OBJECTS,
     _flags: FLT_INSTANCE_TEARDOWN_FLAGS,
 ) -> NTSTATUS {
-    unsafe {
-        log::info!("RamonInstanceTeardownStart. Instance num: {}", INSTANCE_NUMBER);
-    }
+    log::info!(
+        "RamonInstanceTeardownStart. Instance num: {}",
+        INSTANCE_NUMBER.load(Ordering::Relaxed)
+    );
 
     PAGED_CODE!();
     log::info!("RamonInstanceTeardownStart SUCCESS");
@@ -460,8 +583,6 @@ extern "system" fn RamonInstanceTeardownComplete(
 
     PAGED_CODE!();
     log::info!("RamonInstanceTeardownComplete SUCCESS");
-    unsafe {
-        INSTANCE_NUMBER -= 1;
-    }
+    INSTANCE_NUMBER.fetch_sub(1, Ordering::Relaxed);
     STATUS_SUCCESS
 }

@@ -4,12 +4,9 @@
 //!
 //! IRQL: PASSIVE_LEVEL in the pre-ops; no allocation on the allow path (the path is resolved
 //! only when a rule could match).
-#![allow(static_mut_refs)]
-
 use alloc::vec::Vec;
 
 use common::utils::try_extend;
-use kernel_fast_mutex::{auto_lock::AutoLock, fast_mutex::FastMutex, locker::Locker};
 use kernel_macros::HandleToU32;
 use km_api_sys::{ntddk::PsGetCurrentProcessId, ntifs::PsGetCurrentProcess};
 use winapi::{
@@ -24,15 +21,20 @@ extern "system" {
     fn SeTokenIsAdmin(token: PVOID) -> BOOLEAN;
 }
 
+use crate::locked::Locked;
+
 // the System process is always PID 4
 const SYSTEM_PID: u32 = 4;
 
-static mut G_MUTEX: FastMutex = FastMutex::new();
 // path fragments that must not be modified, joined by '\n'. The tagged tier is refused only for a
 // process with a session tag (the agent tree); the any tier is refused for every process. Both are
 // replaced wholesale by the client's RAMON_GUARDRAIL_PATHS / RAMON_GUARDRAIL_ANY_PATHS.
-static mut G_TAGGED: Vec<u8> = Vec::new();
-static mut G_ANY: Vec<u8> = Vec::new();
+struct Rules {
+    tagged: Vec<u8>,
+    any: Vec<u8>,
+}
+
+static G_RULES: Locked<Rules> = Locked::new(Rules { tagged: Vec::new(), any: Vec::new() });
 
 // the agent's own settings and enterprise managed settings; settings.local.json is excluded on
 // purpose (Claude Code writes it when a permission is approved)
@@ -42,7 +44,7 @@ const DEFAULT_TAGGED: &[&str] = &["\\.claude\\settings.json", "\\managed-setting
 pub(crate) unsafe fn init() {
     // FAST_MUTEX::new() leaves Count = 0 (locked); acquiring an uninitialized mutex waits on a
     // zeroed event and bugchecks (0xA). Initialize it before the first lock.
-    G_MUTEX.Init();
+    G_RULES.init();
     set(DEFAULT_TAGGED.iter().copied(), core::iter::empty());
 }
 
@@ -53,9 +55,9 @@ pub(crate) unsafe fn set<'a>(
     // build outside the lock: allocation must not happen while holding it
     let tagged = join_fragments(tagged);
     let any = join_fragments(any);
-    let _locker = AutoLock::new(&mut G_MUTEX);
-    G_TAGGED = tagged;
-    G_ANY = any;
+    let mut rules = G_RULES.lock();
+    rules.tagged = tagged;
+    rules.any = any;
 }
 
 // on allocation failure a fragment is dropped: the config is best-effort, never panics
@@ -69,19 +71,26 @@ fn join_fragments<'a>(fragments: impl Iterator<Item = &'a str>) -> Vec<u8> {
 }
 
 pub(crate) unsafe fn is_protected_tagged(name: &str) -> bool {
-    let _locker = AutoLock::new(&mut G_MUTEX);
-    matches_any(&G_TAGGED, name)
+    matches_any(&G_RULES.lock().tagged, name)
 }
 
 /// True only when the any-process tier has fragments, so the pre-op can skip the name lookup.
 pub(crate) unsafe fn any_active() -> bool {
-    let _locker = AutoLock::new(&mut G_MUTEX);
-    !G_ANY.is_empty()
+    !G_RULES.lock().any.is_empty()
 }
 
 pub(crate) unsafe fn is_protected_any(name: &str) -> bool {
-    let _locker = AutoLock::new(&mut G_MUTEX);
-    matches_any(&G_ANY, name)
+    matches_any(&G_RULES.lock().any, name)
+}
+
+/// Rename/link destinations arrive as UTF-16 before FltMgr can be asked for a full path; match them
+/// against the same fragments without allocating (a bare target name also matches a `\name` rule).
+pub(crate) unsafe fn is_protected_tagged_utf16(name: &[u16]) -> bool {
+    matches_any_utf16(&G_RULES.lock().tagged, name)
+}
+
+pub(crate) unsafe fn is_protected_any_utf16(name: &[u16]) -> bool {
+    matches_any_utf16(&G_RULES.lock().any, name)
 }
 
 fn matches_any(blob: &[u8], name: &str) -> bool {
@@ -89,10 +98,36 @@ fn matches_any(blob: &[u8], name: &str) -> bool {
     blob.split(|byte| *byte == b'\n').any(|fragment| contains_ignore_ascii_case(haystack, fragment))
 }
 
+fn matches_any_utf16(blob: &[u8], name: &[u16]) -> bool {
+    blob.split(|byte| *byte == b'\n')
+        .any(|fragment| contains_ignore_ascii_case_utf16(name, fragment))
+}
+
 fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack.len() >= needle.len()
         && haystack.windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn contains_ignore_ascii_case_utf16(haystack: &[u16], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    contains_utf16_window(haystack, needle)
+        || (needle[0] == b'\\' && contains_utf16_window(haystack, &needle[1..]))
+}
+
+// Rule fragments are stored as UTF-8 ASCII paths; the raw UTF-16 destination fallback can only
+// match those. A non-ASCII rule still works through the normalized-name path, which is tried first.
+fn contains_utf16_window(haystack: &[u16], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack.windows(needle.len()).any(|window| {
+            window
+                .iter()
+                .zip(needle)
+                .all(|(&h, &n)| h <= 0x7f && (h as u8).eq_ignore_ascii_case(&n))
+        })
 }
 
 /// True for SYSTEM and elevated administrators. The any-process tier exempts them: it guards a path

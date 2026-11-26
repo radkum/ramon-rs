@@ -35,7 +35,7 @@ signing, no tests on the host. Read the [Limits](#limits-not-production) section
 | Crate | What it is |
 |---|---|
 | `ramon-km` | the driver (`cdylib`, `no_std`); everything below |
-| `common` | event structs, the port command format, serialization; builds for the driver (`default-features = false`) and for the host |
+| `common` | event structs, the port command format, serialization and the port handshake; builds for the driver (`default-features = false`) and for the host |
 | `ariadne` | process lineage tree (`no_std`) with host tests: process keys `(pid, create_time)`, tags, adoption of orphans, descendant propagation |
 | `ramon-client` | small viewer: connects to the port and prints events |
 
@@ -124,6 +124,12 @@ growth on a kernel path is fallible. `build-std` makes `compiler-builtins` refer
 `fma`/`fmaf`, which a `/NODEFAULTLIB` driver does not link; `ramon-km/src/libm_shim.rs` provides
 non-fused definitions only to satisfy the linker (the driver performs no floating-point math).
 
+The driver and the client share a 32-byte key for the communication-port handshake
+(`common/src/handshake.rs`): the client proves it holds the key with `HMAC-SHA256` over a fresh
+nonce in the connect context, and the driver verifies it. `common/build.rs` injects the key from
+`RAMON_PORT_KEY` (64 hex chars) or a gitignored `.portkey` at the repo root, generating a random one
+on the first build, so no secret is committed.
+
 ## Trying it
 
 The driver is unsigned for release: load it only on a test machine. Enable test signing once
@@ -186,11 +192,16 @@ This is an example. What that means concretely:
 6. **Scope.** x64 only. No policy, no blocking except guardrail denies and Mirage redirection (both
    opt-in over the port), no persistence of state across reboot, no self-protection (the driver is
    not PPL/ELAM), no signature.
-7. **The WFP callout supports one load per boot.** The teardown now copies what it needs under the
-   state lock and calls the WFP APIs after releasing it, so an unload removes the sublayer, callout
-   objects and filters and releases the driver image (`ramon.sys` can be replaced). Registering the
-   callouts a *second* time in the same boot, however, hung the lab VM, so `install.ps1` refuses to
-   load twice without a reboot. Details: [docs/verification.md](docs/verification.md).
+7. **The WFP callout no longer limits reloads.** The teardown copies what it needs under the state
+   lock and calls the WFP APIs after releasing it; the callouts associate no flow contexts (they
+   were never read and `FwpsCalloutUnregisterById0` returns `STATUS_DEVICE_BUSY` while one lives),
+   and every teardown status is logged. A registry-callback cookie bug that bugchecked 0xCE on
+   unload (an out-parameter declared as `&LARGE_INTEGER`, so the compiler stored zero and the
+   callback survived the image) is fixed. A full load → unload → load → unload cycle now works in
+   one boot and `ramon.sys` can be replaced. The communication port accepts only an elevated process
+   whose image name starts with `ramon-client`, so renaming the client prevents it from connecting
+   (a name/elevation check, not a cryptographic handshake). Details:
+   [docs/verification.md](docs/verification.md).
 8. **Mirage and MOTA are detection aids, not boundaries.** Mirage hides a decoy from one process
    tree by rewriting the create path; a determined caller can reach the file by other means. MOTA
    keys on `FileId`, so it sees reopens but not a copy made through an untagged process first.

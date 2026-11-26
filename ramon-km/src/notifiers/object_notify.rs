@@ -10,7 +10,7 @@ use common::{
     event::{handle_open::HandleOpenEvent, Event},
     utils::try_extend,
 };
-use kernel_macros::HandleToU32;
+use kernel_macros::{HandleToU32, NT_SUCCESS};
 use kernel_string::UNICODE_STRING;
 use km_api_sys::ntddk::PsGetCurrentProcessId;
 use winapi::{
@@ -19,7 +19,8 @@ use winapi::{
 };
 
 use crate::{
-    notifiers::process_notify::session_tag_of, send_message::send_message, unicode_string,
+    locked::Locked, notifiers::process_notify::session_tag_of, send_message::send_message,
+    unicode_string,
 };
 
 // not declared in km-api-sys
@@ -74,26 +75,49 @@ struct ObCallbackRegistration {
     operation_registration: *const ObOperationRegistration,
 }
 
-// ObRegisterCallbacks keeps a pointer to the altitude buffer, so both live in kernel static memory
-static mut G_OPERATIONS: [ObOperationRegistration; 1] = [unsafe { mem::zeroed() }];
-static mut G_REGISTRATION: ObCallbackRegistration = unsafe { mem::zeroed() };
-static mut G_HANDLE: PVOID = null_mut();
+// ObRegisterCallbacks keeps a pointer to the altitude buffer and the registration, so both live in
+// kernel static memory. The callback never takes this lock.
+struct Registration {
+    operations: [ObOperationRegistration; 1],
+    registration: ObCallbackRegistration,
+    handle: PVOID,
+}
+
+static G_STATE: Locked<Registration> = Locked::new(Registration {
+    operations: [unsafe { mem::zeroed() }],
+    registration: unsafe { mem::zeroed() },
+    handle: null_mut(),
+});
 
 pub(crate) unsafe fn start() -> NTSTATUS {
-    G_OPERATIONS[0].object_type = PsProcessType;
-    G_OPERATIONS[0].operations = OB_OPERATION_HANDLE_CREATE;
-    G_OPERATIONS[0].pre_operation = Some(OnProcessHandlePreOp);
-    G_REGISTRATION.version = OB_FLT_REGISTRATION_VERSION;
-    G_REGISTRATION.operation_registration_count = 1;
-    G_REGISTRATION.altitude = unicode_string(OB_ALTITUDE);
-    G_REGISTRATION.operation_registration = G_OPERATIONS.as_ptr();
-    ObRegisterCallbacks(&G_REGISTRATION, &mut G_HANDLE)
+    G_STATE.init();
+    let registration = {
+        let mut state = G_STATE.lock();
+        state.operations[0].object_type = PsProcessType;
+        state.operations[0].operations = OB_OPERATION_HANDLE_CREATE;
+        state.operations[0].pre_operation = Some(OnProcessHandlePreOp);
+        state.registration.version = OB_FLT_REGISTRATION_VERSION;
+        state.registration.operation_registration_count = 1;
+        state.registration.altitude = unicode_string(OB_ALTITUDE);
+        state.registration.operation_registration = state.operations.as_ptr();
+        &state.registration as *const ObCallbackRegistration
+    };
+    // PASSIVE-only: do not hold the FAST_MUTEX (it raises IRQL to APC)
+    let mut handle: PVOID = null_mut();
+    let status = ObRegisterCallbacks(registration, &mut handle);
+    if NT_SUCCESS!(status) {
+        G_STATE.lock().handle = handle;
+    }
+    status
 }
 
 pub(crate) unsafe fn stop() {
-    if !G_HANDLE.is_null() {
-        ObUnRegisterCallbacks(G_HANDLE);
-        G_HANDLE = null_mut();
+    // ObUnRegisterCallbacks must run at PASSIVE_LEVEL and waits for in-flight callbacks; the
+    // Locked guard would hold the FAST_MUTEX at APC_LEVEL, so copy the handle and release it first
+    let handle = G_STATE.lock().handle;
+    if !handle.is_null() {
+        ObUnRegisterCallbacks(handle);
+        G_STATE.lock().handle = null_mut();
     }
 }
 

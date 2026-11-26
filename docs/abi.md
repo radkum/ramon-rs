@@ -29,9 +29,18 @@ against the header; a mismatch is silent at compile time and undefined at run ti
 | `KeSetPriorityThread` | undocumented (exported by `ntoskrnl`) | NT 6+ | `send_message.rs` |
 | `DbgPrintEx` | `wdm.h` | NT 4+ | `logger.rs` |
 | `FwpmEngineOpen0`, `FwpmEngineClose0`, `FwpmSubLayerAdd0`, `FwpmSubLayerDeleteByKey0`, `FwpmCalloutAdd0`, `FwpmCalloutDeleteByKey0`, `FwpmFilterAdd0`, `FwpmFilterDeleteById0` | `fwpmk.h` | Windows 7+ | `net.rs` |
-| `FwpsCalloutRegister0`, `FwpsCalloutUnregisterById0`, `FwpsFlowAssociateContext0` | `fwpsk.h` | Windows 7+ | `net.rs` |
+| `FwpsCalloutRegister0`, `FwpsCalloutUnregisterById0` | `fwpsk.h` | Windows 7+ | `net.rs` |
+| `CmRegisterCallbackEx` (local override) | `wdm.h` | Windows Vista+ | `lib.rs` |
 
 Notes:
+
+- **Out-parameters must be pointers.** `km-api-sys` declares `CmRegisterCallbackEx`'s `Cookie` as
+  `&LARGE_INTEGER`. That is an out parameter: with a shared reference the optimizer is allowed to
+  assume the callee does not write through it, and it compiled `*G_COOKIE.lock() = cookie` to a
+  store of zero. `CmUnRegisterCallback(0)` then failed silently and the registry callback survived
+  the image unload (bugcheck 0xCE). The driver declares the function locally with
+  `Cookie: *mut LARGE_INTEGER`; do the same for any other out-parameter that `km-api-sys` types as
+  `&T`.
 
 - Undocumented symbols (`PsGetProcessCreateTimeQuadPart`, `KeSetPriorityThread`) are exported by
   `ntoskrnl.exe` but are not contractual. They are used because the documented alternatives are

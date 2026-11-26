@@ -1,6 +1,7 @@
 use std::{
+    ffi::c_void,
     mem,
-    ptr::{null, null_mut},
+    ptr::null_mut,
     sync::Arc,
 };
 
@@ -11,6 +12,7 @@ use common::{
         get_event_type, image_load::ImageLoadEvent, process_create::ProcessCreateEvent,
         registry_set_value::RegistrySetValueEvent, Event, FileCreateEvent,
     },
+    handshake,
 };
 use console::Term;
 use widestring::u16cstr;
@@ -45,12 +47,16 @@ pub async fn start_detection() {
 fn init_port(port_name: *const u16) -> Option<SmartHandle> {
     let mut connection_port = SmartHandle::new();
 
+    // handshake: prove knowledge of the shared key over a fresh nonce (see common::handshake)
+    let nonce = random_nonce();
+    let proof = handshake::make_proof(handshake::port_key(), &nonce);
+
     let hr = unsafe {
         FilterConnectCommunicationPort(
             port_name,
             0,
-            null(),
-            0,
+            proof.as_ptr() as *const c_void,
+            proof.len() as u16,
             null_mut(),
             connection_port.as_mut_ref() as *mut isize,
         )
@@ -64,6 +70,19 @@ fn init_port(port_name: *const u16) -> Option<SmartHandle> {
     } else {
         Some(connection_port)
     }
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    // RtlGenRandom: the OS CSPRNG, for the per-connect nonce
+    fn SystemFunction036(buffer: *mut u8, length: u32) -> u8;
+}
+
+fn random_nonce() -> [u8; handshake::NONCE_LEN] {
+    let mut nonce = [0u8; handshake::NONCE_LEN];
+    let ok = unsafe { SystemFunction036(nonce.as_mut_ptr(), nonce.len() as u32) };
+    assert!(ok != 0, "RtlGenRandom (SystemFunction036) failed");
+    nonce
 }
 fn message_loop(connection_port: SmartHandle) {
     let arc_connection_port = Arc::new(connection_port);

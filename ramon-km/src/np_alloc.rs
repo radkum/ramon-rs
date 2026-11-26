@@ -2,8 +2,6 @@
 //! paged (kernel-alloc's default), so it cannot back the process tree: a page fault at DISPATCH
 //! bugchecks. `ProcessTree::new_in` takes this as its `RawAlloc`, and it also implements
 //! `core::alloc::Allocator` for `Box::try_new_in` / `Vec::new_in`.
-#![allow(static_mut_refs)]
-
 use core::{
     alloc::{AllocError, Allocator, Layout},
     ptr::NonNull,

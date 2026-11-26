@@ -3,17 +3,18 @@
 //! boot). When a process outside the agent tree opens a marked file, the delayed execution is
 //! reported. The `Flt*Context` and `FltQueryInformationFile` APIs are not in `km-api-sys`, so they are
 //! declared here against the WDK ABI.
-#![allow(static_mut_refs)]
-
 use alloc::string::String;
-use core::{mem::size_of, ptr::null_mut};
+use core::{
+    mem::size_of,
+    ptr::null_mut,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use ariadne::SessionTag;
 use common::event::{
     mota::{FileId, MotaEvent, MOTA_HIT, MOTA_MARK},
     Event,
 };
-use kernel_fast_mutex::{auto_lock::AutoLock, fast_mutex::FastMutex, locker::Locker};
 use kernel_macros::NT_SUCCESS;
 use km_api_sys::{
     constants::APC_LEVEL,
@@ -26,7 +27,7 @@ use winapi::{
     shared::ntdef::{NTSTATUS, PVOID},
 };
 
-use crate::send_message::send_message;
+use crate::{locked::Locked, send_message::send_message};
 
 // FLT_CONTEXT_TYPE / FLT_CONTEXT_END (fltKernel.h)
 const FLT_STREAM_CONTEXT: u16 = 0x0008;
@@ -189,21 +190,27 @@ pub(crate) fn watch_path(path: &str, extension: Option<&str>) -> bool {
 // driver must not fault on OOM).
 const CAPACITY: usize = 4096;
 
-static mut G_MUTEX: FastMutex = FastMutex::new();
-static mut G_RING: [Option<(FileId, SessionTag)>; CAPACITY] = [None; CAPACITY];
-static mut G_NEXT: usize = 0;
+struct Marks {
+    ring: [Option<(FileId, SessionTag)>; CAPACITY],
+    next: usize,
+}
+
+static G_MARKS: Locked<Marks> = Locked::new(Marks { ring: [None; CAPACITY], next: 0 });
 // the connected client scans agent-authored files; its own opens must not count as a hit
-static mut G_CLIENT_PID: u32 = 0;
+static G_CLIENT_PID: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) unsafe fn init() {
-    G_MUTEX.Init();
-    G_RING = [None; CAPACITY];
-    G_NEXT = 0;
-    G_CLIENT_PID = 0;
+    G_MARKS.init();
+    {
+        let mut marks = G_MARKS.lock();
+        marks.ring = [None; CAPACITY];
+        marks.next = 0;
+    }
+    G_CLIENT_PID.store(0, Ordering::Release);
 }
 
 pub(crate) unsafe fn set_client_pid(pid: u32) {
-    G_CLIENT_PID = pid;
+    G_CLIENT_PID.store(pid, Ordering::Release);
 }
 
 /// Loads one marker the client kept on disk (survives a reboot); the driver's ring is rebuilt on
@@ -226,35 +233,30 @@ pub(crate) unsafe fn forget_file(flt_objects: &FLT_RELATED_OBJECTS) {
 }
 
 fn remember(file_id: FileId, session: SessionTag) {
-    unsafe {
-        let _locker = AutoLock::new(&mut G_MUTEX);
-        for entry in G_RING.iter_mut() {
-            if entry.is_some_and(|(id, _)| id == file_id) {
-                *entry = Some((file_id, session));
-                return;
-            }
+    let mut marks = G_MARKS.lock();
+    for entry in marks.ring.iter_mut() {
+        if entry.is_some_and(|(id, _)| id == file_id) {
+            *entry = Some((file_id, session));
+            return;
         }
-        G_RING[G_NEXT] = Some((file_id, session));
-        G_NEXT = (G_NEXT + 1) % CAPACITY;
     }
+    let index = marks.next;
+    marks.ring[index] = Some((file_id, session));
+    marks.next = (index + 1) % CAPACITY;
 }
 
 fn recall(file_id: FileId) -> Option<SessionTag> {
-    unsafe {
-        let _locker = AutoLock::new(&mut G_MUTEX);
-        G_RING.iter().flatten().find(|(id, _)| *id == file_id).map(|(_, session)| *session)
-    }
+    let marks = G_MARKS.lock();
+    marks.ring.iter().flatten().find(|(id, _)| *id == file_id).map(|(_, session)| *session)
 }
 
 // the marked file was deleted: drop the marker, so a FileId NTFS reuses later is not a false hit
 fn forget(file_id: FileId) {
-    unsafe {
-        let _locker = AutoLock::new(&mut G_MUTEX);
-        for entry in G_RING.iter_mut() {
-            if entry.is_some_and(|(id, _)| id == file_id) {
-                *entry = None;
-                return;
-            }
+    let mut marks = G_MARKS.lock();
+    for entry in marks.ring.iter_mut() {
+        if entry.is_some_and(|(id, _)| id == file_id) {
+            *entry = None;
+            return;
         }
     }
 }
@@ -364,7 +366,7 @@ pub(crate) unsafe fn check(
     path: &str,
     extension: Option<&str>,
 ) -> bool {
-    if u64::from(KeGetCurrentIrql()) > APC_LEVEL || pid == unsafe { G_CLIENT_PID } {
+    if u64::from(KeGetCurrentIrql()) > APC_LEVEL || pid == G_CLIENT_PID.load(Ordering::Acquire) {
         return false;
     }
     // only watched paths are ever marked (see file_monitor), so a non-watched open has nothing to

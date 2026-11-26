@@ -6,3 +6,6 @@ target
 *.cer
 *.cat
 dist/
+
+# build-time communication-port shared key (see common/build.rs)
+.portkey
