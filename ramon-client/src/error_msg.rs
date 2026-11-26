@@ -12,7 +12,7 @@ const FACILITY_WIN32: u32 = 0x0007;
 
 pub fn hresult_from_win32(x: i32) -> u32 {
     let x = x as u32;
-    if x <= 0 {
+    if x == 0 {
         x
     } else {
         (x & 0x0000FFFF) | (FACILITY_WIN32 << 16) | 0x80000000

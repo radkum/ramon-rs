@@ -23,9 +23,3 @@ impl Drop for SmartHandle {
         }
     }
 }
-
-impl Into<HANDLE> for SmartHandle {
-    fn into(self) -> HANDLE {
-        self.0
-    }
-}

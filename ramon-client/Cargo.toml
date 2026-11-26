@@ -8,6 +8,8 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 common = { path = "../common"}
+# local dev override: rade = { path = "C:/VSExclude/rade-rs/rade" }
+rade = { git = "https://github.com/radkum/rade-rs.git", tag = "v0.1.2" }
 
 anyhow = "~1"
 clap = { version = "~4", features = ["derive"] }
