@@ -113,11 +113,16 @@ pub(crate) struct FltContextRegistration {
     reserved: PVOID,
 }
 
-const fn no_context(context_type: u16, size: usize, pool_tag: u32) -> FltContextRegistration {
+pub(crate) const fn context_entry(
+    context_type: u16,
+    cleanup: PVOID,
+    size: usize,
+    pool_tag: u32,
+) -> FltContextRegistration {
     FltContextRegistration {
         context_type,
         flags: 0,
-        cleanup: null_mut(),
+        cleanup,
         size,
         pool_tag,
         allocate: null_mut(),
@@ -129,8 +134,14 @@ const fn no_context(context_type: u16, size: usize, pool_tag: u32) -> FltContext
 /// Registered in `FLT_REGISTRATION.ContextRegistration`; the `FLT_CONTEXT_END` entry terminates it and
 /// must be all-zero except for its type (`FLT_STREAM_CONTEXT` itself needs a non-zero pool tag).
 pub(crate) const CONTEXT_REGISTRATION: &[FltContextRegistration] = &[
-    no_context(FLT_STREAM_CONTEXT, size_of::<MotaContext>(), u32::from_ne_bytes(*b"ramM")),
-    no_context(FLT_CONTEXT_END, 0, 0),
+    context_entry(
+        FLT_STREAM_CONTEXT,
+        null_mut(),
+        size_of::<MotaContext>(),
+        u32::from_ne_bytes(*b"ramM"),
+    ),
+    crate::instance::INSTANCE_CONTEXT_ENTRY,
+    context_entry(FLT_CONTEXT_END, null_mut(), 0, 0),
 ];
 
 // extensions whose later execution is worth a per-open FileId lookup (scripts/installers; not .exe/.dll,

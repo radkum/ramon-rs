@@ -166,7 +166,7 @@ impl FileMonitor {
     pub(crate) extern "system" fn RamonPreCreate(
         data: &mut FLT_CALLBACK_DATA,
         flt_objects: &mut FLT_RELATED_OBJECTS,
-        _completion_context: *mut PVOID,
+        completion_context: *mut PVOID,
     ) -> FLT_PREOP_CALLBACK_STATUS {
         // a kernel create (paging I/O, our own I/O) is never the agent's: no post-op needed
         if let KPROCESSOR_MODE::KernelMode = data.RequestorMode {
@@ -189,7 +189,7 @@ impl FileMonitor {
         if !guardrail_needed && !mirage_needed {
             return FLT_PREOP_SUCCESS_WITH_CALLBACK;
         }
-        let Some((file_name, device_name, _)) = file_path(data, flt_objects) else {
+        let Some((file_name, device_name, extension)) = file_path(data, flt_objects) else {
             return FLT_PREOP_SUCCESS_WITH_CALLBACK;
         };
         // guardrail: the agent must never edit its own config; the any tier never refuses SYSTEM/admin
@@ -227,15 +227,22 @@ impl FileMonitor {
                 }
             }
         }
+        // hand the resolved name to post-create so a tagged create resolves it once
+        unsafe {
+            *completion_context =
+                crate::create_handoff::into_completion((file_name, extension));
+        }
         FLT_PREOP_SUCCESS_WITH_CALLBACK
     }
 
     pub(crate) extern "system" fn RamonPostCreate(
         data: &mut FLT_CALLBACK_DATA,
         flt_objects: &mut FLT_RELATED_OBJECTS,
-        _completion_context: PVOID,
+        completion_context: PVOID,
         flags: FLT_POST_OPERATION_FLAGS,
     ) -> FLT_POSTOP_CALLBACK_STATUS {
+        // take the name handed by pre-create; the Box is dropped (freed) on every early return
+        let completion = unsafe { crate::create_handoff::take_completion(completion_context) };
         let mut ntstatus = unsafe { data.IoStatus.__bindgen_anon_1.Status().clone() };
         // the file was not opened, or the instance is being torn down
         if !NT_SUCCESS!(ntstatus)
@@ -263,8 +270,14 @@ impl FileMonitor {
             return FLT_POSTOP_FINISHED_PROCESSING;
         }
 
-        let Some((file_name, _device, extension)) = file_path(data, flt_objects) else {
-            return FLT_POSTOP_FINISHED_PROCESSING;
+        let (file_name, extension) = match completion {
+            Some(info) => (info.guid, info.ext),
+            None => {
+                let Some((guid, _device, ext)) = file_path(data, flt_objects) else {
+                    return FLT_POSTOP_FINISHED_PROCESSING;
+                };
+                (guid, ext)
+            },
         };
         let pid = HandleToU32!(unsafe { PsGetCurrentProcessId() });
         // MOTA: a tagged process writing a watched file marks it; an untagged process opening a marked

@@ -533,14 +533,22 @@ extern "system" fn RamonUnload(flags: FLT_REGISTRATION_FLAGS) -> NTSTATUS {
 
 #[link_section = "PAGE"]
 extern "system" fn RamonInstanceSetup(
-    _flt_objects: PFLT_RELATED_OBJECTS,
+    flt_objects: PFLT_RELATED_OBJECTS,
     _flags: FLT_INSTANCE_SETUP_FLAGS,
-    _volume_device_type: DEVICE_TYPE,
+    volume_device_type: DEVICE_TYPE,
     _volume_filesystem_type: FLT_FILESYSTEM_TYPE,
 ) -> NTSTATUS {
-    log::info!("RamonInstanceSetup");
-    INSTANCE_NUMBER.fetch_add(1, Ordering::Relaxed);
     PAGED_CODE!();
+    if flt_objects.is_null() {
+        return STATUS_SUCCESS;
+    }
+    let device_type = volume_device_type as u32;
+    // volume selection + per-instance state: refuse volumes that never carry agent content
+    if !unsafe { crate::instance::attach(&*flt_objects, device_type) } {
+        return crate::instance::DO_NOT_ATTACH;
+    }
+    INSTANCE_NUMBER.fetch_add(1, Ordering::Relaxed);
+    log::info!("RamonInstanceSetup: attached device type 0x{:x}", device_type);
     STATUS_SUCCESS
 }
 
@@ -576,13 +584,14 @@ extern "system" fn RamonInstanceTeardownStart(
 
 #[link_section = "PAGE"]
 extern "system" fn RamonInstanceTeardownComplete(
-    _flt_objects: PFLT_RELATED_OBJECTS,
+    flt_objects: PFLT_RELATED_OBJECTS,
     _flags: FLT_INSTANCE_TEARDOWN_FLAGS,
 ) -> NTSTATUS {
-    log::info!("RamonInstanceTeardownComplete");
-
     PAGED_CODE!();
-    log::info!("RamonInstanceTeardownComplete SUCCESS");
+    if !flt_objects.is_null() {
+        unsafe { crate::instance::detach(&*flt_objects) };
+    }
+    log::info!("RamonInstanceTeardownComplete");
     INSTANCE_NUMBER.fetch_sub(1, Ordering::Relaxed);
     STATUS_SUCCESS
 }

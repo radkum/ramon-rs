@@ -12,7 +12,9 @@
 
 mod cleaner;
 
+mod create_handoff;
 mod guardrail;
+mod instance;
 mod ioctl_code;
 mod irp;
 mod libm_shim;
