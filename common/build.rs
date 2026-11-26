@@ -14,8 +14,10 @@ extern "system" {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RAMON_PORT_KEY");
-    let root =
-        PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).parent().unwrap().to_path_buf();
+    let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let key_path = root.join(".portkey");
     println!("cargo:rerun-if-changed={}", key_path.display());
 
@@ -37,13 +39,21 @@ fn main() {
     };
     let bytes = parse_key(&hex);
     let source = render(&bytes);
-    fs::write(PathBuf::from(env::var("OUT_DIR").unwrap()).join("port_key.rs"), source)
-        .expect("write port_key.rs");
+    fs::write(
+        PathBuf::from(env::var("OUT_DIR").unwrap()).join("port_key.rs"),
+        source,
+    )
+    .expect("write port_key.rs");
 }
 
 fn parse_key(hex: &str) -> [u8; 32] {
     let hex = hex.trim();
-    assert_eq!(hex.len(), 64, "RAMON_PORT_KEY must be 64 hex chars (32 bytes), got {}", hex.len());
+    assert_eq!(
+        hex.len(),
+        64,
+        "RAMON_PORT_KEY must be 64 hex chars (32 bytes), got {}",
+        hex.len()
+    );
     let mut key = [0u8; 32];
     for (i, byte) in key.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)

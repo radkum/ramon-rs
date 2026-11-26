@@ -1,9 +1,4 @@
-use std::{
-    ffi::c_void,
-    mem,
-    ptr::null_mut,
-    sync::Arc,
-};
+use std::{ffi::c_void, mem, ptr::null_mut, sync::Arc};
 
 use ansi_term::Colour::Green;
 use common::{

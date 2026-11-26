@@ -229,8 +229,7 @@ impl FileMonitor {
         }
         // hand the resolved name to post-create so a tagged create resolves it once
         unsafe {
-            *completion_context =
-                crate::create_handoff::into_completion((file_name, extension));
+            *completion_context = crate::create_handoff::into_completion((file_name, extension));
         }
         FLT_PREOP_SUCCESS_WITH_CALLBACK
     }
