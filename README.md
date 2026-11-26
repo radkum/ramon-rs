@@ -1,5 +1,7 @@
 # RAMON
 
+**Edition 2 of 2 - AI-assisted rewrite and extension (2026).** This edition was rebuilt and extended with an AI assistant. The original, hand-written 2025 minifilter is preserved at [adkum/ramon-rs-legacy](https://github.com/radkum/ramon-rs-legacy).
+
 A Windows kernel sensor written in Rust: a minifilter plus process, image-load, registry, handle-open
 and WFP callouts, streaming structured events to a user-mode client over a minifilter communication
 port.
@@ -196,6 +198,16 @@ This is an example. What that means concretely:
 If you need a production-grade component here, treat this as the reference implementation of the
 callbacks and the protocol, not as the component.
 
+## Editions
+
+| Edition | Year | How it was written | Repository |
+|---|---|---|---|
+| 1 | 2025 | By hand, no AI | [adkum/ramon-rs-legacy](https://github.com/radkum/ramon-rs-legacy) |
+| 2 | 2026 | AI-assisted rewrite and extension | this repository |
+
+Edition 1 is the original minifilter prototype (file-create, process, image-load and registry
+events over a minifilter communication port). This edition keeps that protocol and extends it with
+the techniques described above.
 ## Provenance
 
 Started as the `ramon-rs` example, built on [`windows-kernel-rs`](https://github.com/radkum/windows-kernel-rs)
