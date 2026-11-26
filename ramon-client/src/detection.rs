@@ -43,7 +43,10 @@ fn init_port(port_name: *const u16) -> Option<SmartHandle> {
     let mut connection_port = SmartHandle::new();
 
     // handshake: prove knowledge of the shared key over a fresh nonce (see common::handshake)
-    let nonce = random_nonce();
+    let Some(nonce) = random_nonce() else {
+        eprintln!("RtlGenRandom (SystemFunction036) failed");
+        return None;
+    };
     let proof = handshake::make_proof(handshake::port_key(), &nonce);
 
     let hr = unsafe {
@@ -73,11 +76,10 @@ extern "system" {
     fn SystemFunction036(buffer: *mut u8, length: u32) -> u8;
 }
 
-fn random_nonce() -> [u8; handshake::NONCE_LEN] {
+fn random_nonce() -> Option<[u8; handshake::NONCE_LEN]> {
     let mut nonce = [0u8; handshake::NONCE_LEN];
     let ok = unsafe { SystemFunction036(nonce.as_mut_ptr(), nonce.len() as u32) };
-    assert!(ok != 0, "RtlGenRandom (SystemFunction036) failed");
-    nonce
+    (ok != 0).then_some(nonce)
 }
 fn message_loop(connection_port: SmartHandle) {
     let arc_connection_port = Arc::new(connection_port);
